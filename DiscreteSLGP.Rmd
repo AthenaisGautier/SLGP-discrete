@@ -1,0 +1,1926 @@
+---
+title: "Introduction to SLGP for discrete data"
+author: "Athénaïs Gautier"
+output:
+  html_document:
+  # bookdown::pdf_document2 :
+  #   keep_tex: true
+  #   toc: false
+  #   number_sections: true
+  #   citation_package: natbib
+header-includes:
+  - \usepackage{float}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(viridis)
+library(tidyr)
+```
+
+# Model
+
+
+# Synthetic data-generating processes
+
+We consider two synthetic settings, i.e. two mechanisms generating discrete responses conditionally on input variables.
+
+## Case 1: Binomial with fixed $n$ and varying $p$
+
+Fix $n\in\mathbb{N}$ and let the input be one-dimensional, $\mathbf{X}=p\in(0,1)$. We generate
+$$
+T_{\mathbf{X}}\mid p \sim \mathrm{Bin}(n,p),
+$$
+so that the support is $\{0,\dots,n\}$ and $K=n+1$ (if labels are stored as $\{1,\dots,K\}$, we use the shift $t=k+1$). The conditional pmf is
+$$
+\mathbb{P}(T_{\mathbf{X}}=k)
+=\binom{n}{k}p^{\,k}(1-p)^{n-k},\qquad k=0,\dots,n.
+$$
+
+```{r SLGP_MAP_then_MCMC, message=FALSE, warning=FALSE, eval=FALSE}
+library(SLGP)
+library(rstan)
+library(doParallel)
+library(foreach)
+
+cl <- parallel::makeCluster(10)
+doParallel::registerDoParallel(cl)
+
+dinvgamma <- function(x, alpha=4.5, beta=0.35) {
+  ifelse(x<=0, 0, (beta^alpha / gamma(alpha)) * x^(-alpha - 1) * exp(-beta / x))
+}
+
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+dir.create("./res_synth/case1/SLGP", recursive = TRUE, showWarnings = FALSE)
+
+n_binom <- 10
+K <- n_binom + 1
+sizes <- c(5, 10, 50, 100, 500, 1000)
+seeds <- seq(10)
+
+# MCMC settings (tune)
+mcmc_iter <- 500
+mcmc_chains <- 4
+
+seed <- 1
+for (seed in seeds) {
+  set.seed(seed)
+  
+  ## Generate large dataset
+  df <- data.frame(p = runif(N_large, 0, 1),
+                   output=NA)
+  for(i in seq(N_large)){
+    df$output[i] <- rbinom(n=1, size=n_binom, prob=df$p[i])
+  }
+  
+  n_freq <- 100
+  modelPrior <- slgp(output~p, # Use a formula to specify predictors VS response
+                     data=df[1:5, ],
+                     method="none", #Maximum a posteriori estimation scheme
+                     basisFunctionsUsed = "RFF",
+                     interpolateBasisFun="nothing", # Will Accelerate inference
+                     nIntegral=n_binom+1,
+                     hyperparams = list(lengthscale=c(0.15, 0.15), 
+                                        sigma2=1), 
+                     sigmaEstimationMethod = "heuristic", 
+                     predictorsLower= c(0),
+                     predictorsUpper= c(1),
+                     responseRange= c(0, n_binom),
+                     opts_BasisFun = list(nFreq=n_freq,
+                                          MatParam=5/2),
+                     seed = seed,
+                     opts = list(discrete=TRUE))
+  for (n_train in sizes) {
+    out <- sprintf("./res_synth/case1/SLGP/SLGP_seed%d_nFreq%d_n%d.RData",
+                   seed, n_freq, n_train)
+    if(!(file.exists(out))){
+      cat(out, "\n")
+      idx <- 1:n_train
+      
+      t0 <- Sys.time()
+      hyper_param <- data.frame(expand.grid(seq(0.05, 0.25, 0.025), seq(0.05, 0.25, 0.025)))
+      hyper_param$logPost <- NA
+      colnames(hyper_param)[1:2] <- c("len_out", "len_p")
+      
+      logPost_vec <- foreach(
+        i = seq_len(nrow(hyper_param)),
+        .combine = c,
+        .packages = c("SLGP")  
+      ) %dopar% {  # or %dopar% if you don't care about reproducibility
+        
+        modelMAP <- retrainSLGP(
+          SLGPmodel = modelPrior,
+          newdata = df[1:n_train, ],
+          interpolateBasisFun = "WNN",
+          nIntegral = n_binom + 1,
+          hyperparams = list(
+            lengthscale = c(hyper_param$len_out[i], hyper_param$len_p[i]),
+            sigma2 = 1
+          ),
+          sigmaEstimationMethod = "heuristic",
+          method = "MAP",
+          seed = seed,                 # still pass a per-task seed if your code uses it
+          opts = list(discrete = TRUE)
+        )
+        
+        as.numeric(modelMAP@logPost) +
+          log(dinvgamma(hyper_param$len_out[i])) +
+          log(dinvgamma(hyper_param$len_p[i]))
+      }
+      
+      hyper_param$logPost <- logPost_vec
+      
+      i_max_par <- which.max(hyper_param$logPost)
+      lengthscale_opt <- c(hyper_param$len_out[i_max_par],
+                           hyper_param$len_p[i_max_par])
+      modelMAP <- retrainSLGP(SLGPmodel=modelPrior, 
+                              newdata = df[1:n_train, ],
+                              interpolateBasisFun="WNN", # Will Accelerate inference
+                              nIntegral=n_binom+1,
+                              hyperparams = list(lengthscale=lengthscale_opt, 
+                                                 sigma2=1), 
+                              sigmaEstimationMethod = "heuristic", 
+                              method="MAP",
+                              seed=seed,
+                              opts=list(discrete=TRUE))
+      time_map <- as.numeric( difftime(Sys.time(), t0, units = "secs"))
+      
+      ## -----------------------------
+      ## 2) Laplace
+      ## -----------------------------
+      
+      t1 <- Sys.time()
+      modelLaplace <- retrainSLGP(SLGPmodel=modelMAP, 
+                                  newdata = df[1:n_train, ],
+                                  interpolateBasisFun="WNN", # Will Accelerate inference
+                                  nIntegral=n_binom+1,
+                                  hyperparams = list(lengthscale=lengthscale_opt, 
+                                                     sigma2=1), 
+                                  sigmaEstimationMethod = "heuristic", 
+                                  method="Laplace",
+                                  seed=seed,
+                                  opts=list(discrete=TRUE,
+                                            ndraws=1000))
+      time_lap <- as.numeric( difftime(Sys.time(), t1, units = "secs"))
+      
+      ## -----------------------------
+      ## 3) MCMC
+      ## -----------------------------
+      
+      t2 <- Sys.time()
+      modelMCMC <- retrainSLGP(SLGPmodel=modelMAP, 
+                               newdata = df[1:n_train, ],
+                               interpolateBasisFun="WNN", # Will Accelerate inference
+                               nIntegral=n_binom+1,
+                               hyperparams = list(lengthscale=lengthscale_opt, 
+                                                  sigma2=1), 
+                               sigmaEstimationMethod = "heuristic", 
+                               method="MCMC",
+                               seed=seed,
+                               opts=list(discrete=TRUE,
+                                         stan_iter = mcmc_iter,
+                                         stan_chains = mcmc_chains))
+      time_mcmc <- as.numeric( difftime(Sys.time(), t2, units = "secs"))
+      
+      ## -----------------------------
+      ## Save
+      ## -----------------------------
+      res <- list(
+        case = 1,
+        seed = seed,
+        n_train = n_train,
+        n_binom = n_binom,
+        hyper_map = lengthscale_opt,
+        time_sec = list(map = time_map, lap=time_lap, mcmc = time_mcmc),
+        fit = list(map = modelMAP, lap= modelLaplace, mcmc = modelMCMC)
+      )
+      
+      save(res, file = out)
+      gc()
+      cat(sprintf("seed=%d | nFreq=%d | n=%d | MAP: len_out=%.3f - len_p=%.3f (%.2fs) | Laplace (%.2fs) | MCMC (%.2fs)\n",
+                  seed, n_freq, n_train, lengthscale_opt[1], lengthscale_opt[2], 
+                  time_map, time_lap, time_mcmc))
+    }
+  }
+}
+
+parallel::stopCluster(cl)
+doParallel::registerDoSEQ()
+```
+
+
+```{r SLGP_pred, message=FALSE, warning=FALSE, eval=FALSE}
+library(SLGP)
+library(doParallel)
+library(foreach)
+
+n_binom <- 10
+K <- n_binom + 1
+seeds <- seq(10)
+n_start <- 10
+n_end <- 100
+list_strat<- c("random", "pred_entropy", "bald", "posterior_var")
+grid_pred <- data.frame(expand.grid(seq(0, n_binom), seq(0.01, 0.99,, 99)))
+grid_pred$truth <- NA
+colnames(grid_pred)[1:2] <- c("output", "p")
+for(i in seq(nrow(grid_pred))){
+  grid_pred$truth[i] <- dbinom(x=grid_pred$output[i], size=n_binom, prob=grid_pred$p[i])
+}
+
+sizes <- c(5, 10, 50, 100, 500, 1000)
+seeds <- seq(10)
+
+# MCMC settings (tune)
+mcmc_iter <- 500
+mcmc_chains <- 4
+
+n_freq <- 100
+for (seed in seeds) {
+  df_res <- data.frame()
+  
+  out_compile <- sprintf("./res_synth/case1/SLGPres/SLGP_seed%d_nFreq%d_compil.RData",
+                         seed, n_freq)
+  if(!file.exists(out_compile)){
+    
+    for (n_train in sizes) {
+      out <- sprintf("./res_synth/case1/SLGP/SLGP_seed%d_nFreq%d_n%d.RData",
+                     seed, n_freq, n_train)
+      if((file.exists(out))){
+        cat(out, "\n")
+        load(out)
+        temp <- predictSLGP_newNode(SLGPmodel=res$fit$map, 
+                                    newNodes = grid_pred,
+                                    interpolateBasisFun="nothing",
+                                    nIntegral = n_binom+1,
+                                    discrete=TRUE)
+        temp1 <- temp
+        temp1 <- temp1 %>%
+          pivot_longer(-c("output", "p", "truth"))%>%
+          data.frame() %>%
+          group_by(name, p)%>%
+          rename(real=name)%>%
+          summarise(KL_EstTrue=sum(value * log(value/truth)),
+                    KL_TrueEst=sum(truth * log(truth/value)),
+                    TV= sum(abs(value-truth)), 
+                    H = sqrt(1/2 * (sum((sqrt(truth)-sqrt(value))^2))), .groups="keep") %>%
+          ungroup()%>%
+          pivot_longer(-c("real", "p"))%>%
+          group_by(p, name) %>%
+          summarise(med=median(value), 
+                    q05=quantile(value, probs=0.05), 
+                    q25 = quantile(value, probs=0.25),
+                    q75=quantile(value, probs=0.75), 
+                    q95 = quantile(value, probs=0.95), .groups = "keep")%>%
+          data.frame()
+        temp1$n  <- nrow(res$fit$map@data)
+        temp1$nFreq <- n_freq
+        temp1$seed <- seed
+        temp1$method <- "MAP"
+        temp <- predictSLGP_newNode(SLGPmodel=res$fit$lap, 
+                                    newNodes = grid_pred,
+                                    interpolateBasisFun="nothing",
+                                    nIntegral = n_binom+1,
+                                    discrete=TRUE)
+        temp2 <- temp
+        temp2 <- temp2 %>%
+          pivot_longer(-c("output", "p", "truth"))%>%
+          data.frame() %>%
+          group_by(name, p)%>%
+          rename(real=name)%>%
+          summarise(KL_EstTrue=sum(value * log(value/truth)),
+                    KL_TrueEst=sum(truth * log(truth/value)),
+                    TV= sum(abs(value-truth)), 
+                    H = sqrt(1/2 * (sum((sqrt(truth)-sqrt(value))^2))), .groups="keep") %>%
+          ungroup()%>%
+          pivot_longer(-c("real", "p"))%>%
+          group_by(p, name) %>%
+          summarise(med=median(value), 
+                    q05=quantile(value, probs=0.05), 
+                    q25 = quantile(value, probs=0.25),
+                    q75=quantile(value, probs=0.75), 
+                    q95 = quantile(value, probs=0.95), .groups = "keep")%>%
+          data.frame()
+        temp2$n  <- nrow(res$fit$lap@data)
+        temp2$nFreq <- n_freq
+        temp2$seed <- seed
+        temp2$method <- "Laplace"
+        temp <- predictSLGP_newNode(SLGPmodel=res$fit$mcmc, 
+                                    newNodes = grid_pred,
+                                    interpolateBasisFun="nothing",
+                                    nIntegral = n_binom+1,
+                                    discrete=TRUE)
+        temp3 <- temp
+        temp3 <- temp3 %>%
+          pivot_longer(-c("output", "p", "truth"))%>%
+          data.frame() %>%
+          group_by(name, p)%>%
+          rename(real=name)%>%
+          summarise(KL_EstTrue=sum(value * log(value/truth)),
+                    KL_TrueEst=sum(truth * log(truth/value)),
+                    TV= sum(abs(value-truth)), 
+                    H = sqrt(1/2 * (sum((sqrt(truth)-sqrt(value))^2))), .groups="keep") %>%
+          ungroup()%>%
+          pivot_longer(-c("real", "p"))%>%
+          group_by(p, name) %>%
+          summarise(med=median(value), 
+                    q05=quantile(value, probs=0.05), 
+                    q25 = quantile(value, probs=0.25),
+                    q75=quantile(value, probs=0.75), 
+                    q95 = quantile(value, probs=0.95), .groups = "keep")%>%
+          data.frame()
+        temp3$n  <- nrow(res$fit$mcmc@data)
+        temp3$nFreq <- n_freq
+        temp3$seed <- seed
+        temp3$method <- "MCMC"
+        df_res <- rbind(df_res, temp2, temp3)
+      }
+    }
+    if(nrow(df_res)>0){
+      save(df_res, file=out_compile)
+    }
+  }
+}
+
+```
+
+
+```{r SLGP_visu, message=FALSE, warning=FALSE}
+library(ggplot2)
+
+n_binom <- 10
+K <- n_binom + 1
+
+sizes <- c(5, 10, 50, 100, 500, 1000)
+seeds <- seq(10)
+
+
+seed <- 1
+df <- data.frame()
+for (seed in seeds) {
+  for(n_freq in c(25, 50, 100)){
+    out_compile <- sprintf("./res_synth/case1/SLGPres/SLGP_seed%d_nFreq%d_compil.RData",
+                           seed, n_freq)
+    if(file.exists(out_compile)){
+      load(out_compile)
+      df <- rbind(df, df_res)
+    }
+  }
+}
+
+df %>%
+  filter(name=="KL_EstTrue")%>%
+  filter(nFreq==100)%>%
+  filter(n %in% c(10, 100, 1000))%>%
+  mutate(
+    train_lab = paste0("Training size: ", n),
+    train_lab = factor(train_lab, levels = paste0("Training size: ", sizes))
+  )%>%
+  ggplot() +
+  geom_line(mapping=aes(x=p, y=med, col=method, 
+                        group=paste0(seed, nFreq, method)))+
+  facet_wrap(method~train_lab, ncol=3)+
+  scale_y_log10()+
+  theme_bw() +
+  labs(
+    x = "Parameter p",
+    y = "Median value of KL(SLGP, Bin)",
+  )+
+  theme(legend.position = "")
+ggsave("./Figures/LaplaceVSMCMC.pdf", width=8, height=4)
+```
+
+
+```{r SLGP_seq, message=FALSE, warning=FALSE, eval=FALSE}
+library(SLGP)
+library(rgenoud)
+library(rstan)
+
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+dir.create("./res_synth/case1_seq/SLGP", recursive = TRUE, showWarnings = FALSE)
+
+n_binom <- 10
+K <- n_binom + 1
+seeds <- seq(10)
+n_start <- 10
+n_end <- 38
+list_strat<- c("random", "pred_entropy", "posterior_var", "bald")
+
+grid_pred <- data.frame(expand.grid(seq(0, n_binom), seq(0.01, 0.99,, 99)))
+grid_pred$truth <- NA
+colnames(grid_pred)[1:2] <- c("output", "p")
+for(i in seq(nrow(grid_pred))){
+  grid_pred$truth[i] <- dbinom(x=grid_pred$output[i], 
+                               size=n_binom, 
+                               prob=grid_pred$p[i])
+}
+
+for (seed in seq(5)){
+  n_freq <- 100
+  set.seed(seed)
+  
+  ## Generate starting dataset
+  df_init <- data.frame(p = runif(n_start, 0, 1),
+                        output=NA)
+  for(i in seq(n_start)){
+    df_init$output[i] <- rbinom(n=1, size=n_binom, prob=df_init$p[i])
+  }
+  
+  modelPrior <- slgp(output~p, # Use a formula to specify predictors VS response
+                     data=df_init,
+                     method="none", #Maximum a posteriori estimation scheme
+                     basisFunctionsUsed = "RFF",
+                     interpolateBasisFun="nothing", # Will Accelerate inference
+                     nIntegral=n_binom+1,
+                     hyperparams = list(lengthscale=c(0.25, 0.1), 
+                                        sigma2=1), 
+                     sigmaEstimationMethod = "heuristic", 
+                     predictorsLower= c(0),
+                     predictorsUpper= c(1),
+                     responseRange= c(0, n_binom),
+                     opts_BasisFun = list(nFreq=n_freq,
+                                          MatParam=5/2),
+                     seed = seed,
+                     opts = list(discrete=TRUE))
+  
+  for(strat in list_strat){
+    df <- df_init
+    outfinal <- sprintf("./res_synth/case1_seq/SLGP/SLGP_%s_seed%d_nFreq%d_n%d.RData",
+                        strat, seed, n_freq, n_end)
+    if(!(file.exists(outfinal))){
+      for (step in seq(n_end)) {
+        out <- sprintf("./res_synth/case1_seq/SLGP/SLGP_%s_seed%d_nFreq%d_n%d.RData",
+                       strat, seed, n_freq, step)
+        t0 <- Sys.time()
+        modelLaplace <- retrainSLGP(SLGPmodel=modelPrior, 
+                                    newdata = df,
+                                    interpolateBasisFun="nothing", 
+                                    nIntegral=n_binom+1,
+                                    method="Laplace",
+                                    seed = seed*1e6+nrow(df),
+                                    opts=list(discrete=TRUE,
+                                              ndraws=1000))
+        time_lap <- as.numeric( difftime(Sys.time(), t0, units = "secs"))
+        
+        ## -----------------------------
+        ## Strat
+        ## -----------------------------
+        t1 <- Sys.time()
+        if(strat=="random"){
+          p_new <- runif(1)
+        }else{
+          if(strat=="pred_entropy"){
+            f_obj <- function(x, SLGPmodel){
+              newdf <- data.frame(p=x,
+                                  output=seq(0, n_binom)) 
+              temp <-  predictSLGP_newNode(SLGPmodel=SLGPmodel,
+                                           newNodes = newdf, 
+                                           interpolateBasisFun="nothing",
+                                           nIntegral=n_binom+1,
+                                           discrete=TRUE)
+              temp <- rowMeans(temp[, -c(1:2)])
+              return(-sum(temp*log(temp)))
+            }
+          }
+          if(strat=="bald"){
+            f_obj <- function(x, SLGPmodel){
+              newdf <- data.frame(p=x,
+                                  output=seq(0, n_binom)) 
+              temp <-  predictSLGP_newNode(SLGPmodel=SLGPmodel,
+                                           newNodes = newdf, 
+                                           interpolateBasisFun="nothing",
+                                           nIntegral=n_binom+1,
+                                           discrete=TRUE)
+              temp2 <- rowMeans(temp[, -c(1:2)])
+              term1 <- -sum(temp2*log(temp2))
+              term2 <- -mean(colSums(temp[, -c(1:2)]*log(temp[, -c(1:2)])))
+              return(term1-term2)
+            }
+          }
+          if(strat=="posterior_var"){
+            f_obj <- function(x, SLGPmodel){
+              newdf <- data.frame(p=x,
+                                  output=seq(0, n_binom)) 
+              temp <-  as.matrix(predictSLGP_newNode(SLGPmodel=SLGPmodel,
+                                                     newNodes = newdf,
+                                                     interpolateBasisFun="nothing",
+                                                     nIntegral=n_binom+1,
+                                                     discrete=TRUE)[, -c(1:2)])
+              temp2 <- rowMeans(temp)
+              term <- sum((temp - temp2)^2)/(ncol(temp)-1)
+              return(term)
+            }
+          }
+          set.seed(seed*1e6+nrow(df))
+          x0 <- runif(10)
+          
+          runs <- lapply(x0, function(s) {
+            o <- optim(
+              par = s,
+              fn  = f_obj, 
+              method = "L-BFGS-B",
+              lower = 0, upper = 1,
+              control = list(fnscale = - 1),
+              SLGPmodel=modelLaplace
+            )
+            list(x = o$par, value = o$value)
+          })
+          
+          values <- vapply(runs, `[[`, numeric(1), "value")
+          best_i <- which.max(values)
+          p_new <- runs[[best_i]]$x
+        }
+        set.seed(seed*1e6+nrow(df))
+        t_new <-  rbinom(n=5, size=n_binom, prob=p_new)
+        df <- rbind(df, data.frame(p=p_new, output=t_new))
+        time_des <- as.numeric( difftime(Sys.time(), t1, units = "secs"))
+        ## -----------------------------
+        ## Compare to truth
+        ## -----------------------------
+        t2 <- Sys.time()
+        temp <- predictSLGP_newNode(SLGPmodel=modelLaplace, 
+                                    newNodes = grid_pred,
+                                    interpolateBasisFun="nothing",
+                                    nIntegral = n_binom+1,
+                                    discrete=TRUE)
+        temp <- temp %>%
+          pivot_longer(-c("output", "p", "truth"))%>%
+          data.frame() %>%
+          group_by(name, p)%>%
+          rename(real=name)%>%
+          summarise(KL_EstTrue=sum(value * log(value/truth)),
+                    KL_TrueEst=sum(truth * log(truth/value)),
+                    TV= sum(abs(value-truth)), 
+                    H = sqrt(1/2 * (sum((sqrt(truth)-sqrt(value))^2))),
+                    .groups="keep") %>%
+          ungroup()%>%
+          pivot_longer(-c("real", "p"))%>%
+          group_by(p, name) %>%
+          summarise(med=median(value), 
+                    q05=quantile(value, probs=0.05), 
+                    q25 = quantile(value, probs=0.25),
+                    q75=quantile(value, probs=0.75), 
+                    q95 = quantile(value, probs=0.95), .groups = "keep")%>%
+          data.frame()
+        temp$n  <- nrow(modelLaplace@data)
+        temp$nFreq <- n_freq
+        temp$seed <- seed
+        temp$strat <- strat
+        temp$method <- "Laplace"
+        time_pred <- as.numeric( difftime(Sys.time(), t2, units = "secs"))
+        
+        ## -----------------------------
+        ## Save
+        ## -----------------------------
+        res <- list(
+          case = 1,
+          seed = seed,
+          pred = temp,
+          p_new = p_new,
+          t_new = t_new,
+          time_sec = list(laplace=time_lap, optim=time_des, pred=time_pred),
+          slgp = modelLaplace
+        )
+        save(res, file = out)
+        gc()
+        cat(sprintf("seed=%d | %s | %d | Laplace (%.2fs) | p_new %.4f (%.2fs) | pred (%.2fs) \n",
+                    seed, strat, nrow(df), time_lap, p_new, time_des, time_pred))
+      }
+    }
+  }
+}
+
+```
+
+
+```{r SLGP_compil_seq, message=FALSE, warning=FALSE}
+library(ggplot2)
+
+seeds <- seq(10)
+n_end <- 38
+list_strat<- c("random", "pred_entropy", "posterior_var", "bald")
+df <- data.frame()
+for(seed in seeds){
+  for(strat in list_strat){
+    cat(sprintf("seed = %d | strat = %s | nrow(df) = %d \n",
+                seed, strat, nrow(df)))
+    for (step in seq(n_end)) {
+      out <- sprintf("./res_synth/case1_seq/SLGP/SLGP_%s_seed%d_nFreq%d_n%d.RData",
+                     strat, seed, n_freq, step)
+      if((file.exists(out))){
+        load(out)
+        df <- rbind(df, res$pred)
+      }
+    }
+  }
+}
+save(df, file="./res_synth/case1_seq/compiled.RData")
+```
+
+```{r SLGP_visu_seq, message=FALSE, warning=FALSE}
+load(file="./res_synth/case1_seq/compiled.RData")
+name_map <- c(
+  "H" = "Hellinger(SLGP, Bin)",
+  "KL_EstTrue" = "Kullback-Leibler(SLGP, Bin)",
+  "KL_TrueEst" = "Kullback-Leibler(Bin, SLGP)",
+  "TV" = "Total variation(SLGP, Bin)")
+strat_labs <- c(
+  "random" = "Random",
+  "pred_entropy"  = "Predictive entropy",
+  "posterior_var"  = "Maximum variance",
+  "bald" = "BALD"
+)
+df %>%
+  filter(nFreq == 100) %>%
+  group_by(seed, n, strat, name) %>%
+  summarise(integratedDist = mean(med), .groups = "drop") %>%
+  group_by(n, strat, name) %>%
+  summarise(
+    med = median(integratedDist),
+    q05 = quantile(integratedDist, probs = 0.05),
+    q25 = quantile(integratedDist, probs = 0.25),
+    q75 = quantile(integratedDist, probs = 0.75),
+    q95 = quantile(integratedDist, probs = 0.95),
+    .groups = "drop"
+  ) %>%
+  filter(name %in%c("KL_EstTrue"))%>%
+  ggplot() +
+  geom_line(aes(x = n, y = med, col = strat, group = strat)) +
+  geom_ribbon(aes(x = n, ymin = q25, ymax = q75, fill = strat),
+              alpha = 0.2, lty = 2) +
+  facet_wrap(. ~ name, labeller = 
+               labeller(name = as_labeller(name_map)), 
+             scales = "free_y") +
+  theme_bw() +
+  labs(
+    y = "Integrated distance",
+    x = "n",
+    colour = "Acquisition strategy",  # legend title for lines
+    fill   = "Acquisition strategy"   # legend title for ribbons
+  )+
+  scale_colour_discrete(labels = strat_labs) +
+  scale_fill_discrete(labels = strat_labs)
+
+ggsave("./Figures/Case1_summary.pdf", width=6, height=3.5)
+
+load( sprintf("./res_synth/case1_seq/SLGP/SLGP_%s_seed%d_nFreq%d_n%d.RData",
+              "random", 1, 100, 38))
+df1 <- res$slgp@data
+df1 <- rbind(df1, data.frame(p=res$p_new, output=res$t_new))
+
+modelLaplace1 <- retrainSLGP(SLGPmodel=res$slgp, 
+                             newdata = df1,
+                             interpolateBasisFun="nothing", 
+                             nIntegral=n_binom+1,
+                             method="Laplace",
+                             seed = 1,
+                             opts=list(discrete=TRUE,
+                                       ndraws=1000))
+
+load( sprintf("./res_synth/case1_seq/SLGP/SLGP_%s_seed%d_nFreq%d_n%d.RData",
+              "posterior_var", 1, 100, 38))
+df2<- res$slgp@data
+df2 <- rbind(df2, data.frame(p=res$p_new, output=res$t_new))
+
+modelLaplace2 <- retrainSLGP(SLGPmodel=res$slgp, 
+                             newdata = df2,
+                             interpolateBasisFun="nothing", 
+                             nIntegral=n_binom+1,
+                             method="Laplace",
+                             seed = 1,
+                             opts=list(discrete=TRUE,
+                                       ndraws=1000))
+
+grid_pred <- data.frame(expand.grid(seq(0, n_binom), seq(0, 1,, 101)))
+grid_pred$truth <- NA
+colnames(grid_pred)[1:2] <- c("output", "p")
+for(i in seq(nrow(grid_pred))){
+  grid_pred$truth[i] <- dbinom(x=grid_pred$output[i], 
+                               size=n_binom, 
+                               prob=grid_pred$p[i])
+}
+pred1 <- predictSLGP_newNode(modelLaplace1, 
+                             grid_pred, 
+                             interpolateBasisFun = "nothing", 
+                             nIntegral=11, discrete = TRUE)
+pred2 <- predictSLGP_newNode(modelLaplace2, 
+                             grid_pred, 
+                             interpolateBasisFun = "nothing", 
+                             nIntegral=11, discrete = TRUE)
+grid_pred$random <- rowMeans(pred1[, -c(1:3)])
+grid_pred$posterior_var <- rowMeans(pred2[, -c(1:3)])
+out_ticks <- seq(0, 10, 2)
+grid_pred %>%
+  pivot_longer(-c("p", "output"))%>%
+  filter(p %in% c(0, 0.25, 0.5, 0.75, 1.0))%>%
+  ggplot()+
+  ylab("Probability")+
+  xlab("k")+
+  geom_step(mapping=aes(x=output, y=value, col=name, lty=name), direction = "mid")+
+  facet_grid(.~paste0("p=", p))+
+  theme_bw()+
+  scale_x_continuous(breaks = out_ticks) +  
+  scale_colour_manual(
+    name   = "Estimation method",
+    breaks = c("truth", "random", "posterior_var"), 
+    labels = c(truth   = "Ground truth",
+               random  = "SLGP - random design",
+               posterior_var    = "SLGP - distributional variance"),
+    values=c(truth   = "grey",
+             random  = "cornflowerblue",
+             posterior_var    = "navy"))+  
+  scale_linetype_manual(
+    name   = "Estimation method",
+    breaks = c("truth", "random", "posterior_var"), 
+    labels = c(truth   = "Ground truth",
+               random  = "SLGP - random design",
+               posterior_var    = "SLGP - distributional variance"),
+    values=c(truth   = 2,
+             random  = 1,
+             posterior_var    = 1))
+
+ggsave("./Figures/Case1_pannels.pdf", width=8, height=2.5)
+
+grid_pred %>%
+  filter(p %in% seq(0, 1,, 5))%>%
+  ggplot()+
+  ylab("Probability")+
+  xlab("k")+
+  geom_step(mapping=aes(x=output, y=truth), col="grey", direction = "mid")+
+  facet_grid(.~paste0("p=", p))+
+  theme_bw()+
+  scale_x_continuous(breaks = out_ticks)
+
+ggsave("./Figures/Case1_truth.pdf", width=8, height=2.5)
+
+```
+
+
+## Case 2: Binomial with varying $n$ and $p$
+
+Let $\mathbf{X}=(n,p)\in\{5,\dots,20\}\times(0,1)$ be two indexing variables. We generate
+$$
+T_{\mathbf{X}}\mid (n,p)\sim \mathrm{Bin}(n,p).
+$$
+To keep a fixed label set across inputs, we set $K=21$ and encode outcomes on $\{0,\dots,20\}$ (or $\{1,\dots,21\}$ with the shift). The conditional pmf is
+$$
+\mathbb{P}(T_{\mathbf{X}}=k)=
+\begin{cases}
+\binom{n}{k}p^{\,k}(1-p)^{n-k}, & k=0,\dots,n,\\
+0, & k=n+1,\dots,20.
+\end{cases}
+$$
+
+### No trend 
+
+```{r SLGP_seq2, message=FALSE, warning=FALSE, eval=FALSE}
+library(SLGP)
+library(rstan)
+
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+dir.create("./res_synth/case2_seq/SLGP", recursive = TRUE, showWarnings = FALSE)
+
+seeds <- seq(10)
+n_start <- 10
+n_end <- 38
+list_strat<- c("random", "pred_entropy", "posterior_var", "bald")
+
+grid_pred <- data.frame(expand.grid(seq(0, 20), 
+                                    seq(5, 20), 
+                                    seq(0.01, 0.99, 0.02)))
+grid_pred$truth <- NA
+colnames(grid_pred)[1:3] <- c("output", "n", "p")
+for(i in seq(nrow(grid_pred))){
+  grid_pred$truth[i] <- dbinom(x=grid_pred$output[i], 
+                               size=grid_pred$n[i], 
+                               prob=grid_pred$p[i])
+}
+
+for (seed in seq(1)){
+  n_freq <- 100
+  set.seed(seed)
+  
+  ## Generate starting dataset
+  df_init <- data.frame(output=NA, 
+                        n = sample(seq(5, 20), size=n_start, replace=TRUE), 
+                        p = runif(n_start))
+  for(i in seq(n_start)){
+    df_init$output[i] <- rbinom(1, 
+                                size=df_init$n[i], 
+                                prob=df_init$p[i])
+  }
+  
+  modelPrior <- slgp(output~n+p, # Use a formula to specify predictors VS response
+                     data=df_init,
+                     method="none", #Maximum a posteriori estimation scheme
+                     basisFunctionsUsed = "RFF",
+                     interpolateBasisFun="nothing", # Will Accelerate inference
+                     nIntegral=21,
+                     hyperparams = list(lengthscale=c(0.15, 0.1, 0.1), 
+                                        sigma2=1), 
+                     sigmaEstimationMethod = "heuristic", 
+                     predictorsLower= c(5, 0),
+                     predictorsUpper= c(20, 1),
+                     responseRange= c(0, 20),
+                     opts_BasisFun = list(nFreq=n_freq,
+                                          MatParam=5/2),
+                     seed = seed,
+                     opts = list(discrete=TRUE))
+  for(strat in list_strat){
+    df <- df_init
+    outfinal <- sprintf("./res_synth/case2_seq/SLGP/SLGP_notrend_%s_seed%d_nFreq%d_n%d.RData", strat, seed, n_freq, n_end)
+    if(!(file.exists(outfinal))){
+      for (step in seq(n_end)) {
+        out <- sprintf("./res_synth/case2_seq/SLGP/SLGP_notrend_%s_seed%d_nFreq%d_n%d.RData",
+                       strat, seed, n_freq, step)
+        t0 <- Sys.time()
+        modelLaplace <- retrainSLGP(SLGPmodel=modelPrior, 
+                                    newdata = df,
+                                    interpolateBasisFun="nothing", 
+                                    nIntegral=21,
+                                    method="Laplace",
+                                    seed = seed*1e6+nrow(df),
+                                    opts=list(discrete=TRUE,
+                                              ndraws=1000))
+        time_lap <- as.numeric( difftime(Sys.time(), t0, units = "secs"))
+        
+        ## -----------------------------
+        ## Strat
+        ## -----------------------------
+        t1 <- Sys.time()
+        if(strat=="random"){
+          n_new <- sample(seq(5, 20), size=1, replace=TRUE)
+          p_new <- runif(1)
+        }else{
+          if(strat=="pred_entropy"){
+            f_obj2 <- function(x, n, SLGPmodel){
+              p <- x
+              newdf <- data.frame(n=n,
+                                  p=p,
+                                  output=seq(0, 20)) 
+              temp <-  predictSLGP_newNode(SLGPmodel=SLGPmodel,
+                                           newNodes = newdf, 
+                                           interpolateBasisFun="nothing",
+                                           nIntegral=21,
+                                           discrete=TRUE)
+              temp <- rowMeans(temp[, -c(1:3)])
+              return(-sum(temp*log(temp)))
+            }
+          }
+          if(strat=="bald"){
+            f_obj2 <- function(x, n, SLGPmodel){
+              p <- x
+              newdf <- data.frame(n=n,
+                                  p=p,
+                                  output=seq(0, 20)) 
+              temp <-  predictSLGP_newNode(SLGPmodel=SLGPmodel,
+                                           newNodes = newdf, 
+                                           interpolateBasisFun="nothing",
+                                           nIntegral=21,
+                                           discrete=TRUE)
+              temp2 <- rowMeans(temp[, -c(1:3)])
+              term1 <- -sum(temp2*log(temp2))
+              term2 <- -mean(colSums(temp[, -c(1:3)]*log(temp[, -c(1:3)])))
+              return(term1-term2)
+            }
+          }
+          if(strat=="posterior_var"){
+            f_obj2 <- function(x, n, SLGPmodel){
+              p <- x
+              newdf <- data.frame(n=n,
+                                  p=p,
+                                  output=seq(0, 20)) 
+              temp <-  predictSLGP_newNode(SLGPmodel=SLGPmodel,
+                                           newNodes = newdf, 
+                                           interpolateBasisFun="nothing",
+                                           nIntegral=21,
+                                           discrete=TRUE)[, -c(1:3)]
+              temp2 <- rowMeans(temp)
+              term <- sum((temp - temp2)^2)/(ncol(temp)-1)
+              return(term)
+            }
+          }
+          set.seed(seed*1e6+nrow(df))
+          x0 <- cbind(
+            n = seq(5, 20),
+            p = runif(16)
+          )
+          
+          runs <- lapply(seq(nrow(x0)), function(i) {
+            s <- x0[i, 2]
+            o <- optim(
+              par = as.numeric(s),
+              fn  = f_obj2,  # maximize
+              method = "L-BFGS-B",
+              lower = 0, upper = 1,
+              control = list(fnscale = - 1),
+              SLGPmodel=modelLaplace,
+              n=x0[i, 1])
+            list(x = o$par, value = o$value)
+          })
+          values <- vapply(runs, `[[`, numeric(1), "value")
+          best_i <- which.max(values)
+          p_new <- pmin(pmax(runs[[best_i]]$x, 0), 1)
+          n_new <- x0[best_i, 1]
+        }
+        set.seed(seed*1e6+nrow(df))
+        t_new <-  rbinom(n=5, size=n_new, prob=p_new)
+        df <- rbind(df, data.frame(output=t_new, n=n_new, p=p_new))
+        time_des <- as.numeric( difftime(Sys.time(), t1, units = "secs"))
+        ## -----------------------------
+        ## Compare to truth
+        ## -----------------------------
+        t2 <- Sys.time()
+        temp <- predictSLGP_newNode(SLGPmodel=modelLaplace, 
+                                    newNodes = grid_pred,
+                                    interpolateBasisFun="nothing",
+                                    nIntegral = 21,
+                                    discrete=TRUE)
+        temp <- temp %>%
+          pivot_longer(-c("output", "n", "p", "truth"))%>%
+          data.frame() %>%
+          rename(real=name)%>%
+          rename(estim_pdf=value)%>%
+          rename(truth_pdf=truth)%>%
+          group_by(real, n, p) %>%
+          mutate(estim_cdf = cumsum(estim_pdf),
+                 truth_cdf = cumsum(truth_pdf)) %>%
+          summarise(symCvM = sum((estim_cdf - truth_cdf)^2),
+                    W1 = sum(abs(estim_cdf - truth_cdf)),
+                    TV= 0.5*sum(abs(estim_pdf-truth_pdf)), 
+                    H = sqrt(1/2 * (sum((sqrt(truth_pdf)-sqrt(estim_pdf))^2))),
+                    .groups="keep") %>%
+          ungroup()%>%
+          pivot_longer(-c("real", "p", "n"))%>%
+          group_by(p, n, name) %>%
+          summarise(med=median(value, na.rm=TRUE), 
+                    q05=quantile(value, probs=0.05, na.rm=TRUE), 
+                    q25 = quantile(value, probs=0.25, na.rm=TRUE),
+                    q75=quantile(value, probs=0.75, na.rm=TRUE), 
+                    q95 = quantile(value, probs=0.95, na.rm=TRUE), 
+                    .groups = "keep")%>%
+          data.frame()
+        temp$ntrain  <- nrow(modelLaplace@data)
+        temp$nFreq <- n_freq
+        temp$seed <- seed
+        temp$strat <- strat
+        temp$method <- "Laplace"
+        time_pred <- as.numeric( difftime(Sys.time(), t2, units = "secs"))
+        
+        ## -----------------------------
+        ## Save
+        ## -----------------------------
+        res <- list(
+          case = 2,
+          seed = seed,
+          pred = temp,
+          n_new = n_new,
+          p_new = p_new,
+          t_new = t_new,
+          time_sec = list(laplace=time_lap, optim=time_des, pred=time_pred),
+          slgp = modelLaplace
+        )
+        save(res, file = out)
+        gc()
+        cat(sprintf("seed=%d | %s | %d | Laplace (%.2fs) | p_new %.4f (%.2fs) | pred (%.2fs) \n",
+                    seed, strat, nrow(df), time_lap, p_new, time_des, time_pred))
+      }
+    }
+  }
+}
+
+```
+
+
+```{r SLGP_compile_seq2, message=FALSE, warning=FALSE, eval=FALSE}
+library(ggplot2)
+
+seeds <- seq(10)
+n_end <- 38
+list_strat<- c("random", "pred_entropy", "posterior_var", "bald")
+df <- data.frame()
+for(seed in seeds){
+  for(strat in list_strat){
+    cat(sprintf("seed = %d | strat = %s | nrow(df) = %d \n",
+                seed, strat, nrow(df)))
+    for (step in seq(n_end)) {
+      out <- sprintf("./res_synth/case2_seq/SLGP/SLGP_notrend_%s_seed%d_nFreq%d_n%d.RData",
+                     strat, seed, n_freq, step)
+      if((file.exists(out))){
+        load(out)
+        df <- rbind(df, res$pred)
+      }
+    }
+  }
+}
+save(df, file="./res_synth/case2_seq/compiled_notrend.RData")
+```
+
+```{r SLGP_visu_seq, message=FALSE, warning=FALSE}
+load(file="./res_synth/case2_seq/compiled_notrend.RData")
+
+name_map <- c(
+  "H" = "Hellinger(SLGP, Bin)",
+  "KL_EstTrue" = "Kullback-Leibler(SLGP, Bin)",
+  "KL_TrueEst" = "Kullback-Leibler(Bin, SLGP)",
+  "TV" = "Total variation(SLGP, Bin)",
+  "symCvM" = "Symmetric Cramér von Mises",
+  "W1" = "Wasserstein 1"
+)
+strat_labs <- c(
+  "random" = "Random",
+  "pred_entropy"  = "Predictive entropy",
+  "posterior_var"  = "Maximum variance",
+  "bald" = "BALD"
+)
+df %>%
+  filter(name %in% c("W1")) %>%
+  group_by(seed, ntrain, strat, name) %>%
+  summarise(integratedDist = mean(med), .groups = "drop") %>%
+  group_by(ntrain, strat, name) %>%
+  summarise(
+    med = median(integratedDist),
+    q05 = quantile(integratedDist, probs = 0.05),
+    q25 = quantile(integratedDist, probs = 0.25),
+    q75 = quantile(integratedDist, probs = 0.75),
+    q95 = quantile(integratedDist, probs = 0.95),
+    .groups = "drop"
+  ) %>%
+  ggplot() +
+  geom_line(aes(x = ntrain, y = med, col = strat, group = strat)) +
+  geom_ribbon(aes(x = ntrain, ymin = q25, ymax = q75, fill = strat),
+              alpha = 0.2, lty = 2) +
+  facet_wrap(. ~ name, labeller = 
+               labeller(name = as_labeller(name_map)), 
+             scales = "free_y") +
+  theme_bw() +
+  labs(
+    y = "Integrated distance",
+    x = "n",
+    colour = "Acquisition strategy",  # legend title for lines
+    fill   = "Acquisition strategy"   # legend title for ribbons
+  )+
+  scale_colour_discrete(labels = strat_labs) +
+  scale_fill_discrete(labels = strat_labs)
+
+ggsave("./Figures/Case2notrend_summary.pdf", width=6, height=3.5)
+
+
+load(sprintf("./res_synth/case2_seq/SLGP/SLGP_notrend_%s_seed%d_nFreq%d_n%d.RData",
+             "random", 1, 100, 38))
+df1 <- res$slgp@data
+df1 <- rbind(df1, data.frame(output=res$t_new, n=res$n_new, p=res$p_new))
+
+modelLaplace1 <- retrainSLGP(SLGPmodel=res$slgp, 
+                             newdata = df1,
+                             interpolateBasisFun="nothing", 
+                             nIntegral=21,
+                             method="Laplace",
+                             seed = 1,
+                             opts=list(discrete=TRUE,
+                                       ndraws=1000))
+
+load(sprintf("./res_synth/case2_seq/SLGP/SLGP_notrend_%s_seed%d_nFreq%d_n%d.RData",
+             "bald", 1, 100, 38))
+df2<- res$slgp@data
+df2 <- rbind(df2, data.frame(output=res$t_new, n=res$n_new, p=res$p_new))
+
+modelLaplace2 <- retrainSLGP(SLGPmodel=res$slgp, 
+                             newdata = df2,
+                             interpolateBasisFun="nothing", 
+                             nIntegral=21,
+                             method="Laplace",
+                             seed = 1,
+                             opts=list(discrete=TRUE,
+                                       ndraws=1000))
+
+grid_pred <- data.frame(expand.grid(seq(0, 20), 
+                                    seq(5, 20), 
+                                    seq(0.0, 1.0, 0.25)))
+grid_pred$truth <- NA
+colnames(grid_pred)[1:3] <- c("output", "n", "p")
+for(i in seq(nrow(grid_pred))){
+  grid_pred$truth[i] <- dbinom(x=grid_pred$output[i], 
+                               size=grid_pred$n[i], 
+                               prob=grid_pred$p[i])
+}
+pred1 <- predictSLGP_newNode(modelLaplace1, 
+                             grid_pred, 
+                             interpolateBasisFun = "nothing", 
+                             nIntegral=21, discrete = TRUE)
+pred2 <- predictSLGP_newNode(modelLaplace2, 
+                             grid_pred, 
+                             interpolateBasisFun = "nothing", 
+                             nIntegral=21, discrete = TRUE)
+grid_pred$random <- rowMeans(pred1[, -c(1:4)])
+grid_pred$bald <- rowMeans(pred2[, -c(1:4)])
+out_ticks <- seq(0, 20, 4)
+grid_pred %>%
+  pivot_longer(-c("p", "n", "output"))%>%
+  filter(p %in% c(0, 0.25, 0.5, 0.75, 1.0))%>%
+  filter(n %in% c(7, 8, 9))%>%
+  ggplot()+
+  ylab("Probability")+
+  xlab("k")+
+  geom_step(mapping=aes(x=output, y=value, col=name, lty=name), direction = "mid")+
+  facet_wrap(paste0("n=", n)~paste0("p=", p), nrow=3)+
+  theme_bw()+
+  scale_x_continuous(breaks = out_ticks) +  
+  scale_colour_manual(
+    name   = "Estimation method",
+    breaks = c("truth", "random", "bald"), 
+    labels = c(truth   = "Ground truth",
+               random  = "SLGP - random design",
+               bald    = "SLGP - BALD"),
+    values=c(truth   = "grey",
+             random  = "cornflowerblue",
+             bald    = "navy"))+  
+  scale_linetype_manual(
+    name   = "Estimation method",
+    breaks = c("truth", "random", "bald"), 
+    labels = c(truth   = "Ground truth",
+               random  = "SLGP - random design",
+               bald    = "SLGP - BALD"),
+    values=c(truth   = 2,
+             random  = 1,
+             bald    = 1))
+
+ggsave("./Figures/Case2notrend_pannels.pdf", width=8, height=5)
+
+grid_pred %>%
+  filter(p %in% c(0, 0.25, 0.5, 0.75, 1.0),
+         n %in% c(5, 10, 15, 20)) %>%
+  mutate(
+    n = factor(n, levels = c(5, 10, 15, 20), ordered = TRUE),
+    p = factor(p, levels = c(0, 0.25, 0.5, 0.75, 1.0), ordered = TRUE)
+  ) %>%
+  ggplot() +
+  ylab("Probability") +
+  xlab("k") +
+  geom_step(aes(x = output, y = truth), col = "grey", direction = "mid") +
+  facet_wrap(~ n + p, nrow = 4,
+             labeller = labeller(
+               n = function(x) paste0("n=", x),
+               p = function(x) paste0("p=", x)
+             )) +
+  theme_bw() +
+  scale_x_continuous(breaks = out_ticks)
+
+ggsave("./Figures/Case2_truth.pdf", width=8, height=5)
+
+```
+
+### with trend 
+
+```{r SLGP_seq2trend, message=FALSE, warning=FALSE, eval=FALSE}
+library(SLGP)
+library(rstan)
+
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+dir.create("./res_synth/case2_seq/SLGP", recursive = TRUE, showWarnings = FALSE)
+
+seeds <- seq(10)
+n_start <- 10
+n_end <- 38
+list_strat<- c("random", "pred_entropy", "posterior_var", "bald")
+
+grid_pred <- data.frame(expand.grid(seq(0, 20), 
+                                    seq(5, 20), 
+                                    seq(0.01, 0.99, 0.02)))
+grid_pred$truth <- NA
+colnames(grid_pred)[1:3] <- c("output", "n", "p")
+for(i in seq(nrow(grid_pred))){
+  grid_pred$truth[i] <- dbinom(x=grid_pred$output[i], 
+                               size=grid_pred$n[i], 
+                               prob=grid_pred$p[i])
+}
+
+trend <- function(df){
+  return(ifelse(df$output > df$n, -10, 0))
+}
+
+for (seed in seq(1)){
+  n_freq <- 100
+  set.seed(seed)
+  
+  ## Generate starting dataset
+  df_init <- data.frame(output=NA, 
+                        n = sample(seq(5, 20), size=n_start, replace=TRUE), 
+                        p = runif(n_start))
+  for(i in seq(n_start)){
+    df_init$output[i] <- rbinom(1, 
+                                size=df_init$n[i], 
+                                prob=df_init$p[i])
+  }
+  
+  modelPrior <- slgp(output~n+p, # Use a formula to specify predictors VS response
+                     data=df_init,
+                     trend=trend,
+                     method="none", #Maximum a posteriori estimation scheme
+                     basisFunctionsUsed = "RFF",
+                     interpolateBasisFun="nothing", # Will Accelerate inference
+                     nIntegral=21,
+                     hyperparams = list(lengthscale=c(0.15, 0.1, 0.1), 
+                                        sigma2=1), 
+                     sigmaEstimationMethod = "heuristic", 
+                     predictorsLower= c(5, 0),
+                     predictorsUpper= c(20, 1),
+                     responseRange= c(0, 20),
+                     opts_BasisFun = list(nFreq=n_freq,
+                                          MatParam=5/2),
+                     seed = seed,
+                     opts = list(discrete=TRUE))
+  for(strat in list_strat){
+    df <- df_init
+    outfinal <- sprintf("./res_synth/case2_seq/SLGP/SLGP_trend_%s_seed%d_nFreq%d_n%d.RData", strat, seed, n_freq, n_end)
+    if(!(file.exists(outfinal))){
+      for (step in seq(n_end)) {
+        out <- sprintf("./res_synth/case2_seq/SLGP/SLGP_trend_%s_seed%d_nFreq%d_n%d.RData",
+                       strat, seed, n_freq, step)
+        t0 <- Sys.time()
+        modelLaplace <- retrainSLGP(SLGPmodel=modelPrior, 
+                                    newdata = df,
+                                    trend=trend,
+                                    interpolateBasisFun="nothing", 
+                                    nIntegral=21,
+                                    method="Laplace",
+                                    seed = seed*1e6+nrow(df),
+                                    opts=list(discrete=TRUE,
+                                              ndraws=1000))
+        time_lap <- as.numeric( difftime(Sys.time(), t0, units = "secs"))
+        
+        ## -----------------------------
+        ## Strat
+        ## -----------------------------
+        t1 <- Sys.time()
+        if(strat=="random"){
+          n_new <- sample(seq(5, 20), size=1, replace=TRUE)
+          p_new <- runif(1)
+        }else{
+          if(strat=="pred_entropy"){
+            f_obj2 <- function(x, n, SLGPmodel){
+              p <- x
+              newdf <- data.frame(n=n,
+                                  p=p,
+                                  output=seq(0, 20)) 
+              temp <-  predictSLGP_newNode(SLGPmodel=SLGPmodel,
+                                           newNodes = newdf, 
+                                           interpolateBasisFun="nothing",
+                                           nIntegral=21,
+                                           discrete=TRUE)
+              temp <- rowMeans(temp[, -c(1:3)])
+              return(-sum(temp*log(temp)))
+            }
+          }
+          if(strat=="bald"){
+            f_obj2 <- function(x, n, SLGPmodel){
+              p <- x
+              newdf <- data.frame(n=n,
+                                  p=p,
+                                  output=seq(0, 20)) 
+              temp <-  predictSLGP_newNode(SLGPmodel=SLGPmodel,
+                                           newNodes = newdf, 
+                                           interpolateBasisFun="nothing",
+                                           nIntegral=21,
+                                           discrete=TRUE)
+              temp2 <- rowMeans(temp[, -c(1:3)])
+              term1 <- -sum(temp2*log(temp2))
+              term2 <- -mean(colSums(temp[, -c(1:3)]*log(temp[, -c(1:3)])))
+              return(term1-term2)
+            }
+          }
+          if(strat=="posterior_var"){
+            f_obj2 <- function(x, n, SLGPmodel){
+              p <- x
+              newdf <- data.frame(n=n,
+                                  p=p,
+                                  output=seq(0, 20)) 
+              temp <-  predictSLGP_newNode(SLGPmodel=SLGPmodel,
+                                           newNodes = newdf, 
+                                           interpolateBasisFun="nothing",
+                                           nIntegral=21,
+                                           discrete=TRUE)[, -c(1:3)]
+              temp2 <- rowMeans(temp)
+              term <- sum((temp - temp2)^2)/(ncol(temp)-1)
+              return(term)
+            }
+          }
+          set.seed(seed*1e6+nrow(df))
+          x0 <- cbind(
+            n = seq(5, 20),
+            p = runif(16)
+          )
+          
+          runs <- lapply(seq(nrow(x0)), function(i) {
+            s <- x0[i, 2]
+            o <- optim(
+              par = as.numeric(s),
+              fn  = f_obj2,  # maximize
+              method = "L-BFGS-B",
+              lower = 0, upper = 1,
+              control = list(fnscale = - 1),
+              SLGPmodel=modelLaplace,
+              n=x0[i, 1])
+            list(x = o$par, value = o$value)
+          })
+          values <- vapply(runs, `[[`, numeric(1), "value")
+          best_i <- which.max(values)
+          p_new <- pmin(pmax(runs[[best_i]]$x, 0), 1)
+          n_new <- x0[best_i, 1]
+        }
+        set.seed(seed*1e6+nrow(df))
+        t_new <-  rbinom(n=5, size=n_new, prob=p_new)
+        df <- rbind(df, data.frame(output=t_new, n=n_new, p=p_new))
+        time_des <- as.numeric( difftime(Sys.time(), t1, units = "secs"))
+        ## -----------------------------
+        ## Compare to truth
+        ## -----------------------------
+        t2 <- Sys.time()
+        temp <- predictSLGP_newNode(SLGPmodel=modelLaplace, 
+                                    newNodes = grid_pred,
+                                    interpolateBasisFun="nothing",
+                                    nIntegral = 21,
+                                    discrete=TRUE)
+        
+        temp <- temp %>%
+          pivot_longer(-c("output", "n", "p", "truth"))%>%
+          data.frame() %>%
+          rename(real=name)%>%
+          rename(estim_pdf=value)%>%
+          rename(truth_pdf=truth)%>%
+          group_by(real, n, p) %>%
+          mutate(estim_cdf = cumsum(estim_pdf),
+                 truth_cdf = cumsum(truth_pdf)) %>%
+          summarise(symCvM = sum((estim_cdf - truth_cdf)^2),
+                    W1 = sum(abs(estim_cdf - truth_cdf)),
+                    TV= 0.5*sum(abs(estim_pdf-truth_pdf)), 
+                    H = sqrt(1/2 * (sum((sqrt(truth_pdf)-sqrt(estim_pdf))^2))),
+                    .groups="keep") %>%
+          ungroup()%>%
+          pivot_longer(-c("real", "p", "n"))%>%
+          group_by(p, n, name) %>%
+          summarise(med=median(value, na.rm=TRUE), 
+                    q05=quantile(value, probs=0.05, na.rm=TRUE), 
+                    q25 = quantile(value, probs=0.25, na.rm=TRUE),
+                    q75=quantile(value, probs=0.75, na.rm=TRUE), 
+                    q95 = quantile(value, probs=0.95, na.rm=TRUE), 
+                    .groups = "keep")%>%
+          data.frame()
+        temp$ntrain  <- nrow(modelLaplace@data)
+        temp$nFreq <- n_freq
+        temp$seed <- seed
+        temp$strat <- strat
+        temp$method <- "Laplace"
+        time_pred <- as.numeric( difftime(Sys.time(), t2, units = "secs"))
+        
+        ## -----------------------------
+        ## Save
+        ## -----------------------------
+        res <- list(
+          case = 2,
+          seed = seed,
+          pred = temp,
+          n_new = n_new,
+          p_new = p_new,
+          t_new = t_new,
+          time_sec = list(laplace=time_lap, optim=time_des, pred=time_pred),
+          slgp = modelLaplace
+        )
+        save(res, file = out)
+        gc()
+        cat(sprintf("seed=%d | %s | %d | Laplace (%.2fs) | p_new %.4f (%.2fs) | pred (%.2fs) \n",
+                    seed, strat, nrow(df), time_lap, p_new, time_des, time_pred))
+      }
+    }
+  }
+}
+
+```
+
+
+```{r SLGP_compile_seq2trend, message=FALSE, warning=FALSE, eval=FALSE}
+library(ggplot2)
+
+seeds <- seq(10)
+n_end <- 38
+list_strat<- c("random", "pred_entropy", "posterior_var", "bald")
+df <- data.frame()
+for(seed in seeds){
+  for(strat in list_strat){
+    cat(sprintf("seed = %d | strat = %s | nrow(df) = %d \n",
+                seed, strat, nrow(df)))
+    for (step in seq(n_end)) {
+      out <- sprintf("./res_synth/case2_seq/SLGP/SLGP_trend_%s_seed%d_nFreq%d_n%d.RData",
+                     strat, seed, n_freq, step)
+      if((file.exists(out))){
+        load(out)
+        df <- rbind(df, res$pred)
+      }
+    }
+  }
+}
+save(df, file="./res_synth/case2_seq/compiled_trend.RData")
+```
+
+
+```{r SLGP_visu_seq2trend, message=FALSE, warning=FALSE}
+load(file="./res_synth/case2_seq/compiled_trend.RData")
+
+name_map <- c(
+  "H" = "Hellinger(SLGP, Bin)",
+  "KL_EstTrue" = "Kullback-Leibler(SLGP, Bin)",
+  "KL_TrueEst" = "Kullback-Leibler(Bin, SLGP)",
+  "TV" = "Total variation(SLGP, Bin)",
+  "symCvM" = "Symmetric Cramér von Mises",
+  "W1" = "Wasserstein 1"
+)
+strat_labs <- c(
+  "random" = "Random",
+  "pred_entropy"  = "Predictive entropy",
+  "posterior_var"  = "Maximum variance",
+  "bald" = "BALD"
+)
+df %>%
+  filter(name %in% c("W1")) %>%
+  group_by(seed, ntrain, strat, name) %>%
+  summarise(integratedDist = mean(med), .groups = "drop") %>%
+  group_by(ntrain, strat, name) %>%
+  summarise(
+    med = median(integratedDist),
+    q05 = quantile(integratedDist, probs = 0.05),
+    q25 = quantile(integratedDist, probs = 0.25),
+    q75 = quantile(integratedDist, probs = 0.75),
+    q95 = quantile(integratedDist, probs = 0.95),
+    .groups = "drop"
+  ) %>%
+  ggplot() +
+  geom_line(aes(x = ntrain, y = med, col = strat, group = strat)) +
+  geom_ribbon(aes(x = ntrain, ymin = q25, ymax = q75, fill = strat),
+              alpha = 0.2, lty = 2) +
+  facet_wrap(. ~ name, labeller = 
+               labeller(name = as_labeller(name_map)), 
+             scales = "free_y") +
+  theme_bw() +
+  labs(
+    y = "Integrated distance",
+    x = "n",
+    colour = "Acquisition strategy",  # legend title for lines
+    fill   = "Acquisition strategy"   # legend title for ribbons
+  )+
+  scale_colour_discrete(labels = strat_labs) +
+  scale_fill_discrete(labels = strat_labs)
+
+ggsave("./Figures/Case2trend_summary.pdf", width=6, height=3.5)
+
+
+load(sprintf("./res_synth/case2_seq/SLGP/SLGP_trend_%s_seed%d_nFreq%d_n%d.RData",
+             "random", 1, 100, 38))
+df1 <- res$slgp@data
+df1 <- rbind(df1, data.frame(output=res$t_new, n=res$n_new, p=res$p_new))
+
+modelLaplace1 <- retrainSLGP(SLGPmodel=res$slgp, 
+                             newdata = df1,
+                             interpolateBasisFun="nothing", 
+                             nIntegral=21,
+                             method="Laplace",
+                             seed = 1,
+                             opts=list(discrete=TRUE,
+                                       ndraws=1000))
+
+load(sprintf("./res_synth/case2_seq/SLGP/SLGP_trend_%s_seed%d_nFreq%d_n%d.RData",
+             "posterior_var", 1, 100, 38))
+df2<- res$slgp@data
+df2 <- rbind(df2, data.frame(output=res$t_new, n=res$n_new, p=res$p_new))
+
+modelLaplace2 <- retrainSLGP(SLGPmodel=res$slgp, 
+                             newdata = df2,
+                             interpolateBasisFun="nothing", 
+                             nIntegral=21,
+                             method="Laplace",
+                             seed = 1,
+                             opts=list(discrete=TRUE,
+                                       ndraws=1000))
+
+grid_pred <- data.frame(expand.grid(seq(0, 20), 
+                                    seq(5, 20), 
+                                    seq(0.0, 1.0, 0.25)))
+grid_pred$truth <- NA
+colnames(grid_pred)[1:3] <- c("output", "n", "p")
+for(i in seq(nrow(grid_pred))){
+  grid_pred$truth[i] <- dbinom(x=grid_pred$output[i], 
+                               size=grid_pred$n[i], 
+                               prob=grid_pred$p[i])
+}
+pred1 <- predictSLGP_newNode(modelLaplace1, 
+                             grid_pred, 
+                             interpolateBasisFun = "nothing", 
+                             nIntegral=21, discrete = TRUE)
+pred2 <- predictSLGP_newNode(modelLaplace2, 
+                             grid_pred, 
+                             interpolateBasisFun = "nothing", 
+                             nIntegral=21, discrete = TRUE)
+grid_pred$random <- rowMeans(pred1[, -c(1:4)])
+grid_pred$bald <- rowMeans(pred2[, -c(1:4)])
+out_ticks <- seq(0, 20, 4)
+grid_pred %>%
+  pivot_longer(-c("p", "n", "output"))%>%
+  filter(p %in% c(0, 0.25, 0.5, 0.75, 1.0))%>%
+  filter(n %in% c(5, 10, 15))%>%
+  ggplot()+
+  ylab("Probability")+
+  xlab("k")+
+  geom_step(mapping=aes(x=output, y=value, col=name, lty=name), direction = "mid")+
+  facet_wrap(paste0("n=", n)~paste0("p=", p), nrow=3)+
+  theme_bw()+
+  scale_x_continuous(breaks = out_ticks) +  
+  scale_colour_manual(
+    name   = "Estimation method",
+    breaks = c("truth", "random", "bald"), 
+    labels = c(truth   = "Ground truth",
+               random  = "SLGP - random design",
+               bald    = "SLGP - BALD"),
+    values=c(truth   = "grey",
+             random  = "cornflowerblue",
+             bald    = "navy"))+  
+  scale_linetype_manual(
+    name   = "Estimation method",
+    breaks = c("truth", "random", "bald"), 
+    labels = c(truth   = "Ground truth",
+               random  = "SLGP - random design",
+               bald    = "SLGP - BALD"),
+    values=c(truth   = 2,
+             random  = 1,
+             bald    = 1))
+
+ggsave("./Figures/Case2trend_pannels.pdf", width=8, height=5)
+
+```
+
+# Real data
+
+```{r eval=FALSE}
+# install.packages("rgbif")
+library(rgbif)
+
+# search for a species key
+key <- name_backbone(name="Bombus terrestris")$usageKey
+
+df_occ <- data.frame()
+# download occurrences in a region
+for(year in seq(2000, 2020, 5)){
+  cat("Year: ", year, "\n")
+  occ <- occ_search(
+    taxonKey = key,
+    hasCoordinate = TRUE,
+    limit = 20000,
+    country = "FR",
+    eventDate = paste0(year, ",", year+5))
+  
+  df <- occ$data
+  df <- df[, c("key", "decimalLatitude" , "decimalLongitude", "year", "month", "day", "eventDate", "elevation")]
+  df_occ <- rbind(df_occ, df)
+  
+}
+df_occ <- unique(df_occ)
+save(df_occ, file="Bumblebee_occ.Rdata")
+```
+
+```{r}
+library(rgbif)
+
+load(file="Bumblebee_occ.Rdata")
+
+df_occ <- df_occ %>%
+  filter(year %in% seq(2019, 2023))
+# Core packages
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(rnaturalearth)
+
+# If you get s2-related topology errors with intersections:
+sf::sf_use_s2(FALSE)
+
+# ---- Inputs: your points in lon/lat ----
+# df must contain decimalLongitude, decimalLatitude
+pts <- st_as_sf(
+  df_occ,
+  coords = c("decimalLongitude", "decimalLatitude"),
+  crs = 4326,
+  remove = FALSE
+)
+pts_l93    <- st_transform(pts,    2154)
+
+# ---- France polygon (metropolitan) ----
+fr0 <- rnaturalearth::ne_countries(
+  scale = "medium", country = "France", returnclass = "sf"
+) %>% st_make_valid()
+fr_met <- fr0 %>%
+  st_transform(4326) %>%
+  st_crop(xmin = -6, xmax = 10, ymin = 41, ymax = 52) %>%
+  st_make_valid()
+# Project to Lambert-93 (meters) for a meaningful hex size
+fr_met_l93 <- st_transform(fr_met, 2154)
+
+# ---- Hex grid covering France ----
+hex_size <- 40000  # meters (e.g., 5e3, 1e4, 2e4, ...)
+
+# 1) make the grid (sfc)
+hex_sfc <- st_make_grid(
+  fr_met_l93,
+  cellsize = hex_size,
+  square = FALSE,
+  what = "polygons"
+)
+# 2) convert to sf with an id
+hex <- st_sf(
+  hex_id = seq_along(hex_sfc),
+  geometry = hex_sfc
+)
+# Keep full hexagons that intersect France (robust; no cutting)
+hex_fr <- st_filter(hex, fr_met_l93, .predicate = st_intersects)
+
+# ---- Aggregate: number of points per hex ----
+# Join points -> hex_id, then count
+pt_hex <- st_join(pts_l93, hex_fr["hex_id"], join = st_intersects, left = FALSE)
+
+hex_counts <- pt_hex %>%
+  st_drop_geometry() %>%
+  count(hex_id, name = "n")
+
+hex_fr <- hex_fr %>%
+  left_join(hex_counts, by = "hex_id") %>%
+  mutate(n = if_else(is.na(n), 0L, n))%>%
+  mutate(n = if_else(n>=250, 250L, n))
+
+ggplot() +
+  geom_sf(data = hex_fr, aes(fill = n/5), color = "grey70", linewidth = 0.1) +
+  geom_sf(data = fr_met_l93, fill = NA, color = "white", linewidth = 1.0) +
+  geom_sf(data = fr_met_l93, fill = NA, color = "black", linewidth = 0.5) +
+  scale_fill_viridis_c(
+    transf="log1p",
+    name = "Average yearly count",
+    limits=c(0.2, 50),
+    na.value = NA,
+    guide = guide_colorbar(
+      title.position = "top",
+      barheight = unit(0.2, "cm"),  
+      barwidth  = unit(8.0, "cm"))) +
+  coord_sf(crs = 2154) +
+  theme_minimal()+
+  theme(legend.position = "bottom")
+ggsave("Figures/bumble_aggreg.pdf", width=4, height=4)
+
+
+ggplot() +
+  geom_sf(data = fr_met_l93, fill = NA, color = "white", linewidth = 1.0) +
+  geom_sf(data = fr_met_l93, fill = NA, color = "black", linewidth = 0.5) +
+  geom_sf(data = pts_l93, size = 0.25, alpha = 0.4) +
+  coord_sf(crs = 2154) +
+  theme_minimal()
+ggsave("Figures/bumble_RAWpts.pdf", width=4, height=4)
+
+
+hex_counts <- pt_hex %>%
+  st_drop_geometry() %>%
+  group_by(year)%>%
+  count(hex_id, name = "n")
+
+hex_fr <- st_filter(hex, fr_met_l93, .predicate = st_intersects)
+hex_fr <- hex_fr %>%
+  left_join(hex_counts, by = "hex_id") %>%
+  mutate(n = if_else(is.na(n), 0L, n))%>%
+  mutate(n = if_else(n>=50, 50, n))
+
+for(year in seq(2019, 2023)){
+  ggplot() +
+    geom_sf(data = hex_fr[hex_fr$year==year, ], aes(fill = n), color = "grey70", linewidth = 0.1) +
+    geom_sf(data = fr_met_l93, fill = NA, color = "white", linewidth = 1.0) +
+    geom_sf(data = fr_met_l93, fill = NA, color = "black", linewidth = 0.5) +
+    scale_fill_viridis_c(
+      transf="log1p",
+      name = "Yearly count",
+      limits=c(0.2, 50),
+      na.value = NA,
+      guide = guide_colorbar(
+        title.position = "top",
+        barheight = unit(0.2, "cm"),  
+        barwidth  = unit(8.0, "cm"))) +
+    coord_sf(crs = 2154) +
+    theme_minimal()+
+    theme(legend.position = "bottom")+
+    labs(caption = paste0("Total occurences: ", sum(hex_fr$n[hex_fr$year==year], na.rm = TRUE)))
+  ggsave(paste0("Figures/bumble/bumble_aggreg", year, ".pdf"), width=4, height=4)
+}
+
+
+hex_counts <- pt_hex %>%
+  st_drop_geometry() %>%
+  filter(year%in%seq(2020, 2021))%>%
+  count(hex_id, name = "n")
+
+hex_fr <- st_filter(hex, fr_met_l93, .predicate = st_intersects)
+hex_fr <- hex_fr %>%
+  left_join(hex_counts, by = "hex_id") %>%
+  mutate(n = if_else(is.na(n), 0L, n))%>%
+  mutate(n = if_else(n>=100, 100, n))
+
+ggplot() +
+  geom_sf(data = hex_fr, 
+          aes(fill = n/2), color = "grey70", linewidth = 0.1) +
+  geom_sf(data = fr_met_l93, fill = NA, color = "white", linewidth = 1.0) +
+  geom_sf(data = fr_met_l93, fill = NA, color = "black", linewidth = 0.5) +
+  scale_fill_viridis_c(
+    transf="log1p",
+    name = "Average yearly count",
+    limits=c(0.2, 50),
+    na.value = NA,
+    guide = guide_colorbar(
+      title.position = "top",
+      barheight = unit(0.2, "cm"),  
+      barwidth  = unit(8.0, "cm")))+
+  coord_sf(crs = 2154) +
+  theme_minimal()+
+  theme(legend.position = "bottom")
+ggsave(paste0("Figures/bumble_aggreg2021", ".pdf"), width=4, height=4)
+
+
+
+hex_counts <- pt_hex %>%
+  st_drop_geometry() %>%
+  group_by(year)%>%
+  count(hex_id, name = "n")
+
+hex_fr <- st_filter(hex, fr_met_l93, .predicate = st_intersects)
+hex_fr <- hex_fr %>%
+  left_join(hex_counts, by = "hex_id") %>%
+  mutate(n = if_else(is.na(n), 0L, n))%>%
+  mutate(n = if_else(n>=50, 50, n))
+
+cent_l93 <- st_centroid(hex_fr)
+cent_wgs <- st_transform(cent_l93, 4326)
+
+coord_df_wgs <- cent_wgs %>%
+  mutate(lon = st_coordinates(.)[, 1],
+         lat = st_coordinates(.)[, 2]) %>%
+  st_drop_geometry() %>%
+  select(hex_id, n, lon, lat, year)
+
+data <- coord_df_wgs
+
+```
+
+```{r}
+library(SLGP)
+data_pred <- data %>%
+  select(hex_id, lon, lat) %>%
+  unique()
+
+temp <- expand.grid(seq(nrow(data_pred)), seq(2019, 2023))
+
+data_all <- data.frame(data_pred[temp[, 1], ], year=temp[, 2])
+data_all <- left_join(data_all, data, by=c("lon", "lat", "year"))
+data_all$n[is.na(data_all$n)] <- 0
+data_all$hex_id.x <- data_all$hex_id.y <- NULL
+
+data_all$new_n <- ifelse(data_all$n>=50, 50, data_all$n)
+
+data_train <- data_all %>%
+  filter(year %in% seq(2020, 2021))%>%
+  select(lon, lat, new_n) %>%
+  unique()
+
+trend <- function(df){
+  return(ifelse(df$n<1, 0.15, 0))
+}
+
+model <- slgp(new_n~lon+lat, # Use a formula to specify predictors VS response
+               data=data_train[data_train$new_n >0, ],
+               method="Laplace",                
+               trend=trend,
+               basisFunctionsUsed = "RFF",
+               interpolateBasisFun="NN",
+               nIntegral=51,
+               hyperparams = list(lengthscale=c(0.07, 0.03, 0.03), 
+                                  sigma2=5.0), 
+               predictorsLower= c(-5.1, 41.0),
+               predictorsUpper= c(10, 51.5),
+               responseRange= c(0, 50),
+               opts_BasisFun = list(nFreq=250,
+                                    MatParam=5/2),
+               seed = 1,
+               opts=list(discrete=TRUE,
+                         ndraws=100))
+
+data_pred <- data %>%
+  select(hex_id, lon, lat) %>%
+  unique()
+
+temp <- expand.grid(seq(nrow(data_pred)), seq(0, 50))
+
+data_pred <- data.frame(data_pred[temp[, 1], ], new_n=temp[, 2])
+
+pred <- predictSLGP_newNode(model, 
+                             data_pred, 
+                             interpolateBasisFun = "nothing", 
+                             nIntegral=51, discrete = TRUE)
+
+pred$meanSLGP <- rowMeans(pred[, 4+c(1:100)])
+
+library(Hmisc)
+df_plot <- pred %>%
+  select(hex_id, new_n, lon, lat, meanSLGP)%>%
+  group_by(hex_id, lon, lat) %>%
+  summarise(n1=new_n[which.max(meanSLGP)], .groups="keep") %>%
+  data.frame()
+
+data_train%>%
+  group_by(lon, lat) %>%
+  summarise(new_n = median(new_n))%>%
+ ggplot()+
+  geom_point(aes(fill = new_n, x=lon, y=lat), color = "grey70",  pch=23) +
+  scale_fill_viridis_c(
+    trans = "log1p",
+    name = "Average yearly count",
+    limits = c(0.2, 50),
+    na.value = NA,
+    guide = guide_colorbar(
+      title.position = "top",
+      barheight = unit(0.2, "cm"),
+      barwidth  = unit(8.0, "cm")
+    )
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+ggsave(paste0("Figures/bumble_ref", ".png"), width=4, height=4)
+
+ggplot() +
+  geom_point(data = df_plot1, 
+             aes(fill = n1, x=lon, y=lat), color = "grey70",  pch=23) +
+  scale_fill_viridis_c(
+    transf="log1p",
+    name = "Average yearly count",
+    limits=c(0.2, 50),
+    na.value = NA,
+    guide = guide_colorbar(
+      title.position = "top",
+      barheight = unit(0.2, "cm"),  
+      barwidth  = unit(8.0, "cm")))+
+  theme_minimal()+
+  theme(legend.position = "bottom")
+ggsave(paste0("Figures/bumble_pred1", ".png"), width=4, height=4)
+
+library(dplyr)
+library(ggplot2)
+library(sf)
+
+hex_counts <- pt_hex %>%
+  st_drop_geometry() %>%
+  group_by(year)%>%
+  count(hex_id, name = "n")
+
+hex_fr <- st_filter(hex, fr_met_l93, .predicate = st_intersects)
+hex_fr <- hex_fr %>%
+  left_join(hex_counts, by = "hex_id") %>%
+  mutate(n = if_else(is.na(n), 0L, n))%>%
+  mutate(n = if_else(n>=50, 50, n))
+
+hex_plot <- hex_fr %>%
+  left_join(df_plot, by = c("hex_id"))
+
+ggplot(hex_plot) +
+  geom_sf(aes(fill = n), color = "grey70", linewidth = 0.1) + 
+  geom_sf(data = fr_met_l93, fill = NA, color = "white", linewidth = 1.0) +
+  geom_sf(data = fr_met_l93, fill = NA, color = "black", linewidth = 0.5) +
+  scale_fill_viridis_c(
+    transf="log1p",
+    name = "Mode of the posterior mean",
+    limits=c(0.2, 50),
+    na.value = NA,
+    guide = guide_colorbar(
+      title.position = "top",
+      barheight = unit(0.2, "cm"),  
+      barwidth  = unit(8.0, "cm")))+
+  coord_sf(crs = 2154) +
+  theme_minimal()+
+  theme(legend.position = "bottom")
+ggsave(paste0("Figures/bumble_pred2", ".pdf"), width=4, height=4)
+
+```
+
+
