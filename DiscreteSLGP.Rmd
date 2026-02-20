@@ -1025,11 +1025,25 @@ for(seed in seeds){
     }
   }
 }
-save(df, file="./res_synth/case2_seq/compiled_notrend.RData")
+
+
+df_pt1 <- df[1:2000000, ]
+df_pt2 <- df[2000000+1:2000000, ]
+df_pt3 <- df[-c(1:4000000), ]
+
+save(df_pt1, file="./res_synth/case2_seq/compiled_notrend1.RData")
+save(df_pt2, file="./res_synth/case2_seq/compiled_notrend2.RData")
+save(df_pt3, file="./res_synth/case2_seq/compiled_notrend3.RData")
+
 ```
 
-```{r SLGP_visu_seq, message=FALSE, warning=FALSE}
-load(file="./res_synth/case2_seq/compiled_notrend.RData")
+
+```{r SLGP_visu_seq2trend, message=FALSE, warning=FALSE}
+load(file="./res_synth/case2_seq/compiled_notrend1.RData")
+load(file="./res_synth/case2_seq/compiled_notrend2.RData")
+load(file="./res_synth/case2_seq/compiled_notrend3.RData")
+df <- rbind(df_pt1, df_pt2, df_pt3)
+rm(df_pt1, df_pt2, df_pt3)
 
 name_map <- c(
   "H" = "Hellinger(SLGP, Bin)",
@@ -1433,12 +1447,22 @@ for(seed in seeds){
     }
   }
 }
-save(df, file="./res_synth/case2_seq/compiled_trend.RData")
+df_pt1 <- df[1:2000000, ]
+df_pt2 <- df[2000000+1:2000000, ]
+df_pt3 <- df[-c(1:4000000), ]
+
+save(df_pt1, file="./res_synth/case2_seq/compiled_trend1.RData")
+save(df_pt2, file="./res_synth/case2_seq/compiled_trend2.RData")
+save(df_pt3, file="./res_synth/case2_seq/compiled_trend3.RData")
 ```
 
 
 ```{r SLGP_visu_seq2trend, message=FALSE, warning=FALSE}
-load(file="./res_synth/case2_seq/compiled_trend.RData")
+load(file="./res_synth/case2_seq/compiled_trend1.RData")
+load(file="./res_synth/case2_seq/compiled_trend2.RData")
+load(file="./res_synth/case2_seq/compiled_trend3.RData")
+df <- rbind(df_pt1, df_pt2, df_pt3)
+rm(df_pt1, df_pt2, df_pt3)
 
 name_map <- c(
   "H" = "Hellinger(SLGP, Bin)",
