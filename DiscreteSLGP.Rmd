@@ -1089,7 +1089,8 @@ df %>%
     .groups = "drop"
   ) %>%
   ggplot() +
-  geom_line(aes(x = ntrain, y = med, col = strat, group = strat)) +
+  geom_line(aes(x = ntrain, y = med, col = strat, 
+                group = strat, linetype = strat)) +
   geom_ribbon(aes(x = ntrain, ymin = q25, ymax = q75, fill = strat, 
                   colour = strat, linetype = strat),
               alpha = 0.2, linewidth=0.1) +
@@ -1512,7 +1513,8 @@ df %>%
     .groups = "drop"
   ) %>%
   ggplot() +
-  geom_line(aes(x = ntrain, y = med, col = strat, group = strat)) +
+  geom_line(aes(x = ntrain, y = med, col = strat, 
+                group = strat, linetype = strat)) +
   geom_ribbon(aes(x = ntrain, ymin = q25, ymax = q75, fill = strat, 
                   colour = strat, linetype = strat),
               alpha = 0.2, linewidth=0.1) +
