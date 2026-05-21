@@ -23,6 +23,10 @@ library(ggplot2)
 library(ggpubr)
 library(viridis)
 library(tidyr)
+library(SLGP)
+library(rstan)
+library(doParallel)
+library(foreach)
 ```
 
 # Model
@@ -65,6 +69,7 @@ dir.create("./res_synth/case1/SLGP", recursive = TRUE, showWarnings = FALSE)
 n_binom <- 10
 K <- n_binom + 1
 sizes <- c(5, 10, 50, 100, 500, 1000)
+N_large <- max(sizes)
 seeds <- seq(10)
 
 # MCMC settings (tune)
@@ -603,7 +608,7 @@ for (seed in seq(5)){
 ```
 
 
-```{r SLGP_compil_seq, message=FALSE, warning=FALSE}
+```{r SLGP_compil_seq, message=FALSE, eval=FALSE, warning=FALSE}
 library(ggplot2)
 
 seeds <- seq(10)
@@ -637,9 +642,13 @@ name_map <- c(
 strat_labs <- c(
   "random" = "Random",
   "pred_entropy"  = "Predictive entropy",
-  "posterior_var"  = "Maximum variance",
+  "posterior_var"  = "Distributional variance",
   "bald" = "BALD"
 )
+strat_vals <- c("random" = "solid",
+                "pred_entropy"  = "dashed",
+                "posterior_var" = "dotted",
+                "bald"          = "twodash")
 df %>%
   filter(nFreq == 100) %>%
   group_by(seed, n, strat, name) %>%
@@ -655,9 +664,10 @@ df %>%
   ) %>%
   filter(name %in%c("KL_EstTrue"))%>%
   ggplot() +
-  geom_line(aes(x = n, y = med, col = strat, group = strat)) +
-  geom_ribbon(aes(x = n, ymin = q25, ymax = q75, fill = strat),
-              alpha = 0.2, lty = 2) +
+  geom_line(aes(x = n, y = med, col = strat, group = strat, linetype = strat)) +
+  geom_ribbon(aes(x = n, ymin = q25, ymax = q75, fill = strat, 
+                  colour = strat, linetype = strat),
+              alpha = 0.2, linewidth=0.1) +
   facet_wrap(. ~ name, labeller = 
                labeller(name = as_labeller(name_map)), 
              scales = "free_y") +
@@ -666,11 +676,13 @@ df %>%
     y = "Integrated distance",
     x = "n",
     colour = "Acquisition strategy",  # legend title for lines
+    linetype = "Acquisition strategy",  # legend title for linetype
     fill   = "Acquisition strategy"   # legend title for ribbons
   )+
   scale_colour_discrete(labels = strat_labs) +
-  scale_fill_discrete(labels = strat_labs)
-
+  scale_fill_discrete(labels = strat_labs)+
+  scale_linetype_manual(labels = strat_labs,
+                        values=strat_vals)
 ggsave("./Figures/Case1_summary.pdf", width=6, height=3.5)
 
 load( sprintf("./res_synth/case1_seq/SLGP/SLGP_%s_seed%d_nFreq%d_n%d.RData",
@@ -1038,7 +1050,7 @@ save(df_pt3, file="./res_synth/case2_seq/compiled_notrend3.RData")
 ```
 
 
-```{r SLGP_visu_seq2trend, message=FALSE, warning=FALSE}
+```{r SLGP_visu_seq2, message=FALSE, warning=FALSE}
 load(file="./res_synth/case2_seq/compiled_notrend1.RData")
 load(file="./res_synth/case2_seq/compiled_notrend2.RData")
 load(file="./res_synth/case2_seq/compiled_notrend3.RData")
@@ -1056,9 +1068,13 @@ name_map <- c(
 strat_labs <- c(
   "random" = "Random",
   "pred_entropy"  = "Predictive entropy",
-  "posterior_var"  = "Maximum variance",
+  "posterior_var"  = "Distributional variance",
   "bald" = "BALD"
 )
+strat_vals <- c("random" = "solid",
+                "pred_entropy"  = "dashed",
+                "posterior_var" = "dotted",
+                "bald"          = "twodash")
 df %>%
   filter(name %in% c("W1")) %>%
   group_by(seed, ntrain, strat, name) %>%
@@ -1074,8 +1090,9 @@ df %>%
   ) %>%
   ggplot() +
   geom_line(aes(x = ntrain, y = med, col = strat, group = strat)) +
-  geom_ribbon(aes(x = ntrain, ymin = q25, ymax = q75, fill = strat),
-              alpha = 0.2, lty = 2) +
+  geom_ribbon(aes(x = ntrain, ymin = q25, ymax = q75, fill = strat, 
+                  colour = strat, linetype = strat),
+              alpha = 0.2, linewidth=0.1) +
   facet_wrap(. ~ name, labeller = 
                labeller(name = as_labeller(name_map)), 
              scales = "free_y") +
@@ -1084,10 +1101,13 @@ df %>%
     y = "Integrated distance",
     x = "n",
     colour = "Acquisition strategy",  # legend title for lines
+    linetype = "Acquisition strategy",  # legend title for linetype
     fill   = "Acquisition strategy"   # legend title for ribbons
   )+
   scale_colour_discrete(labels = strat_labs) +
-  scale_fill_discrete(labels = strat_labs)
+  scale_fill_discrete(labels = strat_labs)+
+  scale_linetype_manual(labels = strat_labs,
+                        values = strat_vals)
 
 ggsave("./Figures/Case2notrend_summary.pdf", width=6, height=3.5)
 
@@ -1475,7 +1495,7 @@ name_map <- c(
 strat_labs <- c(
   "random" = "Random",
   "pred_entropy"  = "Predictive entropy",
-  "posterior_var"  = "Maximum variance",
+  "posterior_var"  = "Distributional variance",
   "bald" = "BALD"
 )
 df %>%
@@ -1493,8 +1513,9 @@ df %>%
   ) %>%
   ggplot() +
   geom_line(aes(x = ntrain, y = med, col = strat, group = strat)) +
-  geom_ribbon(aes(x = ntrain, ymin = q25, ymax = q75, fill = strat),
-              alpha = 0.2, lty = 2) +
+  geom_ribbon(aes(x = ntrain, ymin = q25, ymax = q75, fill = strat, 
+                  colour = strat, linetype = strat),
+              alpha = 0.2, linewidth=0.1) +
   facet_wrap(. ~ name, labeller = 
                labeller(name = as_labeller(name_map)), 
              scales = "free_y") +
@@ -1503,10 +1524,13 @@ df %>%
     y = "Integrated distance",
     x = "n",
     colour = "Acquisition strategy",  # legend title for lines
+    linetype = "Acquisition strategy",  # legend title for linetype
     fill   = "Acquisition strategy"   # legend title for ribbons
   )+
   scale_colour_discrete(labels = strat_labs) +
-  scale_fill_discrete(labels = strat_labs)
+  scale_fill_discrete(labels = strat_labs)+
+  scale_linetype_manual(labels = strat_labs,
+                        values=strat_vals)
 
 ggsave("./Figures/Case2trend_summary.pdf", width=6, height=3.5)
 
@@ -1833,22 +1857,22 @@ trend <- function(df){
 }
 
 model <- slgp(new_n~lon+lat, # Use a formula to specify predictors VS response
-               data=data_train[data_train$new_n >0, ],
-               method="Laplace",                
-               trend=trend,
-               basisFunctionsUsed = "RFF",
-               interpolateBasisFun="NN",
-               nIntegral=51,
-               hyperparams = list(lengthscale=c(0.07, 0.03, 0.03), 
-                                  sigma2=5.0), 
-               predictorsLower= c(-5.1, 41.0),
-               predictorsUpper= c(10, 51.5),
-               responseRange= c(0, 50),
-               opts_BasisFun = list(nFreq=250,
-                                    MatParam=5/2),
-               seed = 1,
-               opts=list(discrete=TRUE,
-                         ndraws=100))
+              data=data_train[data_train$new_n >0, ],
+              method="Laplace",                
+              trend=trend,
+              basisFunctionsUsed = "RFF",
+              interpolateBasisFun="NN",
+              nIntegral=51,
+              hyperparams = list(lengthscale=c(0.07, 0.03, 0.03), 
+                                 sigma2=5.0), 
+              predictorsLower= c(-5.1, 41.0),
+              predictorsUpper= c(10, 51.5),
+              responseRange= c(0, 50),
+              opts_BasisFun = list(nFreq=250,
+                                   MatParam=5/2),
+              seed = 1,
+              opts=list(discrete=TRUE,
+                        ndraws=100))
 
 data_pred <- data %>%
   select(hex_id, lon, lat) %>%
@@ -1859,9 +1883,9 @@ temp <- expand.grid(seq(nrow(data_pred)), seq(0, 50))
 data_pred <- data.frame(data_pred[temp[, 1], ], new_n=temp[, 2])
 
 pred <- predictSLGP_newNode(model, 
-                             data_pred, 
-                             interpolateBasisFun = "nothing", 
-                             nIntegral=51, discrete = TRUE)
+                            data_pred, 
+                            interpolateBasisFun = "nothing", 
+                            nIntegral=51, discrete = TRUE)
 
 pred$meanSLGP <- rowMeans(pred[, 4+c(1:100)])
 
@@ -1875,7 +1899,7 @@ df_plot <- pred %>%
 data_train%>%
   group_by(lon, lat) %>%
   summarise(new_n = median(new_n))%>%
- ggplot()+
+  ggplot()+
   geom_point(aes(fill = new_n, x=lon, y=lat), color = "grey70",  pch=23) +
   scale_fill_viridis_c(
     trans = "log1p",
@@ -1894,7 +1918,7 @@ data_train%>%
 ggsave(paste0("Figures/bumble_ref", ".png"), width=4, height=4)
 
 ggplot() +
-  geom_point(data = df_plot1, 
+  geom_point(data = df_plot, 
              aes(fill = n1, x=lon, y=lat), color = "grey70",  pch=23) +
   scale_fill_viridis_c(
     transf="log1p",
