@@ -403,7 +403,6 @@ df %>%
 ggsave("./Figures/LaplaceVSMCMC.pdf", width=8, height=4)
 ```
 
-
 ```{r SLGP_seq, message=FALSE, warning=FALSE, eval=FALSE}
 library(SLGP)
 library(rgenoud)
@@ -430,7 +429,7 @@ for(i in seq(nrow(grid_pred))){
                                prob=grid_pred$p[i])
 }
 
-for (seed in seq(5)){
+for (seed in seq(10)){
   n_freq <- 100
   set.seed(seed)
   
@@ -561,12 +560,17 @@ for (seed in seq(5)){
         temp <- temp %>%
           pivot_longer(-c("output", "p", "truth"))%>%
           data.frame() %>%
-          group_by(name, p)%>%
           rename(real=name)%>%
-          summarise(KL_EstTrue=sum(value * log(value/truth)),
-                    KL_TrueEst=sum(truth * log(truth/value)),
-                    TV= sum(abs(value-truth)), 
-                    H = sqrt(1/2 * (sum((sqrt(truth)-sqrt(value))^2))),
+          rename(estim_pdf=value)%>%
+          rename(truth_pdf=truth)%>%
+          group_by(real, p) %>%
+          mutate(estim_cdf = cumsum(estim_pdf),
+                 truth_cdf = cumsum(truth_pdf))%>%
+          summarise(W1 = sum(abs(estim_cdf - truth_cdf)),
+                    KL_EstTrue=sum(estim_pdf * log(estim_pdf/truth_pdf)),
+                    KL_TrueEst=sum(truth_pdf * log(truth_pdf/estim_pdf)),
+                    TV= sum(abs(estim_pdf-truth_pdf)), 
+                    H = sqrt(1/2 * (sum((sqrt(truth_pdf)-sqrt(estim_pdf))^2))),
                     .groups="keep") %>%
           ungroup()%>%
           pivot_longer(-c("real", "p"))%>%
@@ -608,8 +612,13 @@ for (seed in seq(5)){
 ```
 
 
-```{r SLGP_compil_seq, message=FALSE, eval=FALSE, warning=FALSE}
+
+```{r SLGP_compil_seq, message=FALSE, warning=FALSE, eval=FALSE}
 library(ggplot2)
+
+dir.create("./res_synth/case1_seq/datasets",
+           recursive = TRUE,
+           showWarnings = FALSE)
 
 seeds <- seq(10)
 n_end <- 38
@@ -625,6 +634,16 @@ for(seed in seeds){
       if((file.exists(out))){
         load(out)
         df <- rbind(df, res$pred)
+        
+        if(step == n_end && strat == "random"){
+          df_data <- rbind(res$slgp@data, 
+                           data.frame(output=res$t_new, p=res$p_new))
+          
+          write.csv(df_data,
+                    sprintf("./res_synth/case1_seq/datasets/random_seed%d.csv",seed),
+                    row.names = FALSE)
+        }
+        
       }
     }
   }
@@ -635,20 +654,17 @@ save(df, file="./res_synth/case1_seq/compiled.RData")
 ```{r SLGP_visu_seq, message=FALSE, warning=FALSE}
 load(file="./res_synth/case1_seq/compiled.RData")
 name_map <- c(
+  "W1" = "Integrated Wasserstein 1 (SLGP, Bin)",
   "H" = "Hellinger(SLGP, Bin)",
-  "KL_EstTrue" = "Kullback-Leibler(SLGP, Bin)",
-  "KL_TrueEst" = "Kullback-Leibler(Bin, SLGP)",
+  "KL_EstTrue" = "Integrated Kullback-Leibler(SLGP, Bin)",
+  "KL_TrueEst" = "Integrated Kullback-Leibler(Bin, SLGP)",
   "TV" = "Total variation(SLGP, Bin)")
 strat_labs <- c(
   "random" = "Random",
   "pred_entropy"  = "Predictive entropy",
-  "posterior_var"  = "Distributional variance",
+  "posterior_var"  = "Maximum variance",
   "bald" = "BALD"
 )
-strat_vals <- c("random" = "solid",
-                "pred_entropy"  = "dashed",
-                "posterior_var" = "dotted",
-                "bald"          = "twodash")
 df %>%
   filter(nFreq == 100) %>%
   group_by(seed, n, strat, name) %>%
@@ -662,12 +678,12 @@ df %>%
     q95 = quantile(integratedDist, probs = 0.95),
     .groups = "drop"
   ) %>%
-  filter(name %in%c("KL_EstTrue"))%>%
+  #filter(name %in%c("W1"))%>%
+  filter(name %in%c("KL_TrueEst"))%>%
   ggplot() +
-  geom_line(aes(x = n, y = med, col = strat, group = strat, linetype = strat)) +
-  geom_ribbon(aes(x = n, ymin = q25, ymax = q75, fill = strat, 
-                  colour = strat, linetype = strat),
-              alpha = 0.2, linewidth=0.1) +
+  geom_line(aes(x = n, y = med, col = strat, group = strat)) +
+  geom_ribbon(aes(x = n, ymin = q25, ymax = q75, fill = strat),
+              alpha = 0.2, lty = 2) +
   facet_wrap(. ~ name, labeller = 
                labeller(name = as_labeller(name_map)), 
              scales = "free_y") +
@@ -676,13 +692,11 @@ df %>%
     y = "Integrated distance",
     x = "n",
     colour = "Acquisition strategy",  # legend title for lines
-    linetype = "Acquisition strategy",  # legend title for linetype
     fill   = "Acquisition strategy"   # legend title for ribbons
   )+
   scale_colour_discrete(labels = strat_labs) +
-  scale_fill_discrete(labels = strat_labs)+
-  scale_linetype_manual(labels = strat_labs,
-                        values=strat_vals)
+  scale_fill_discrete(labels = strat_labs)
+
 ggsave("./Figures/Case1_summary.pdf", width=6, height=3.5)
 
 load( sprintf("./res_synth/case1_seq/SLGP/SLGP_%s_seed%d_nFreq%d_n%d.RData",
@@ -774,6 +788,428 @@ grid_pred %>%
   scale_x_continuous(breaks = out_ticks)
 
 ggsave("./Figures/Case1_truth.pdf", width=8, height=2.5)
+
+```
+
+
+```{r xgboost, message=FALSE, warning=FALSE, eval=FALSE}
+library(xgboost)
+
+in_dir <- "./res_synth/case1_seq/datasets"
+out_dir <- "./res_synth/case1_seq/xgboost"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+for (seed in seq(10)){
+  full_df <- read.csv(file=sprintf("./res_synth/case1_seq/datasets/random_seed%d.csv",seed))
+  for (step in c(10, 50, 100, 200)) {
+    df_train <- full_df[1:step, ]
+    dtrain <- xgb.DMatrix(
+      data = as.matrix(df_train[, "p"]),
+      label = as.integer(df_train$output)
+    )
+    params <- list(
+      eta = 0.01,
+      max_depth = 1,
+      objective = "multi:softprob",
+      num_class = K,
+      eval_metric = "mlogloss")
+    
+    t0 <- Sys.time()
+    
+    fit <- xgb.train(
+      params = params,
+      data = dtrain,
+      nrounds = 1000,
+      verbose = 1
+    )
+    fit_time <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+    
+    ## -----------------------------
+    ## Compare to truth
+    ## -----------------------------
+    pred_vec <- predict(fit, as.matrix(seq(0.00, 1.0,, 101)))
+    
+    temp <- as.data.frame(expand.grid(
+      p = seq(0.00, 1.0,, 101),
+      output = 0:n_binom
+    ))
+    
+    temp$pred <- as.vector(pred_vec)
+    temp$truth <- NA
+    for(i in seq(nrow(temp))){
+      temp$truth[i] <- dbinom(x=temp$output[i], 
+                              size=n_binom, 
+                              prob=temp$p[i])
+    }
+    temp2 <- temp %>%
+      pivot_longer(-c("output", "p", "truth"))%>%
+      filter(!p %in% c(0, 1))%>%
+      data.frame() %>%
+      rename(real=name)%>%
+      rename(estim_pdf=value)%>%
+      rename(truth_pdf=truth)%>%
+      group_by(real, p) %>%
+      mutate(estim_cdf = cumsum(estim_pdf),
+             truth_cdf = cumsum(truth_pdf))%>%
+      summarise(W1 = sum(abs(estim_cdf - truth_cdf)),
+                KL_EstTrue=sum(estim_pdf * log(estim_pdf/truth_pdf)),
+                KL_TrueEst=sum(truth_pdf * log(truth_pdf/estim_pdf)),
+                TV= sum(abs(estim_pdf-truth_pdf)), 
+                H = sqrt(1/2 * (sum((sqrt(truth_pdf)-sqrt(estim_pdf))^2))),
+                .groups="keep") %>%
+      data.frame()
+    temp2$n  <- nrow(modelLaplace@data)
+    temp2$strat <- "pred_entropy"
+    time_pred <- as.numeric( difftime(Sys.time(), t2, units = "secs"))
+    
+    ## -----------------------------
+    ## Save
+    ## -----------------------------
+    res <- data.frame(seed=seed,
+                      step=step,
+                      n=step,
+                      method="xgboost",
+                      design="random",
+                      IKL_TrueEst = mean(temp2$KL_TrueEst),
+                      IKL_EstTrue = mean(temp2$KL_EstTrue),
+                      IW1 = mean(temp2$W1),
+                      fit_time_sec=fit_time)
+    write.csv(res,
+              sprintf("./res_synth/case1_seq/xgboost/summary_seed%s_n%d.csv",
+                      seed, step),
+              row.names = FALSE)
+    write.csv(temp,
+              sprintf("./res_synth/case1_seq/xgboost/pred_seed%s_n%d.csv",
+                      seed, step),
+              row.names = FALSE)
+    
+  }
+}
+
+```
+
+
+```{r xgboost_seq, message=FALSE, warning=FALSE, eval=FALSE}
+library(xgboost)
+
+in_dir <- "./res_synth/case1_seq/datasets"
+out_dir <- "./res_synth/case1_seq/xgboost"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+for (seed in seq(10)){
+  set.seed(seed)
+  
+  ## Generate starting dataset
+  df_init <- data.frame(p = runif(n_start, 0, 1),
+                        output=NA)
+  for(i in seq(n_start)){
+    df_init$output[i] <- rbinom(n=1, size=n_binom, prob=df_init$p[i])
+  }
+  
+  df <- df_init
+  outfinal <- sprintf("./res_synth/case1_seq/xgboost/entropy_seed%d_n%d.csv",
+                      seed, n_end)
+  if(!(file.exists(outfinal))){
+    for (step in seq(n_end+1)) {
+      out <- sprintf("./res_synth/case1_seq/xgboost/entropy_seed%d_n%d.csv",
+                     seed, step)
+      dtrain <- xgb.DMatrix(
+        data = as.matrix(df[, "p"]),
+        label = as.integer(df$output)
+      )
+      params <- list(
+        eta = 0.01,
+        max_depth = 1,
+        objective = "multi:softprob",
+        num_class = K,
+        eval_metric = "mlogloss")
+      
+      t0 <- Sys.time()
+      
+      fit <- xgb.train(
+        params = params,
+        data = dtrain,
+        nrounds = 1000,
+        verbose = 1
+      )
+      fit_time <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+      
+      ## -----------------------------
+      ## Strat
+      ## -----------------------------
+      
+      f_obj <- function(x, fit){
+        temp <- predict(fit, as.matrix(x, ncol=1))
+        return(-sum(temp*log(temp)))
+      }
+      
+      set.seed(seed*1e6+nrow(df))
+      x0 <- runif(10)
+      
+      runs <- lapply(x0, function(s) {
+        o <- optim(
+          par = s,
+          fn  = f_obj, 
+          method = "L-BFGS-B",
+          lower = 0, upper = 1,
+          control = list(fnscale = - 1),
+          fit=fit
+        )
+        list(x = o$par, value = o$value)
+      })
+      
+      values <- vapply(runs, `[[`, numeric(1), "value")
+      best_i <- which.max(values)
+      p_new <- runs[[best_i]]$x
+      
+      set.seed(seed*1e6+nrow(df))
+      t_new <-  rbinom(n=5, size=n_binom, prob=p_new)
+      df <- rbind(df, data.frame(p=p_new, output=t_new))
+      
+      ## -----------------------------
+      ## Compare to truth
+      ## -----------------------------
+      pred_vec <- predict(fit, as.matrix(seq(0.00, 1.0,, 101)))
+      
+      temp <- as.data.frame(expand.grid(
+        p = seq(0.00, 1.0,, 101),
+        output = 0:n_binom
+      ))
+      
+      temp$pred <- as.vector(pred_vec)
+      temp$truth <- NA
+      for(i in seq(nrow(temp))){
+        temp$truth[i] <- dbinom(x=temp$output[i], 
+                                size=n_binom, 
+                                prob=temp$p[i])
+      }
+      temp2 <- temp %>%
+        pivot_longer(-c("output", "p", "truth"))%>%
+        filter(!p %in% c(0, 1))%>%
+        data.frame() %>%
+        rename(real=name)%>%
+        rename(estim_pdf=value)%>%
+        rename(truth_pdf=truth)%>%
+        group_by(real, p) %>%
+        mutate(estim_cdf = cumsum(estim_pdf),
+               truth_cdf = cumsum(truth_pdf))%>%
+        summarise(W1 = sum(abs(estim_cdf - truth_cdf)),
+                  KL_EstTrue=sum(estim_pdf * log(estim_pdf/truth_pdf)),
+                  KL_TrueEst=sum(truth_pdf * log(truth_pdf/estim_pdf)),
+                  TV= sum(abs(estim_pdf-truth_pdf)), 
+                  H = sqrt(1/2 * (sum((sqrt(truth_pdf)-sqrt(estim_pdf))^2))),
+                  .groups="keep") %>%
+        data.frame()
+      temp2$n  <- nrow(modelLaplace@data)
+      temp2$strat <- "pred_entropy"
+      time_pred <- as.numeric( difftime(Sys.time(), t2, units = "secs"))
+      
+      ## -----------------------------
+      ## Save
+      ## -----------------------------
+      res <- data.frame(seed=seed,
+                        step=step,
+                        n=nrow(dtrain),
+                        method="xgboost",
+                        design="pred_entropy",
+                        IKL_TrueEst = mean(temp2$KL_TrueEst),
+                        IKL_EstTrue = mean(temp2$KL_EstTrue),
+                        IW1 = mean(temp2$W1),
+                        fit_time_sec=fit_time)
+      write.csv(res,
+                file=out,
+                row.names = FALSE)
+      gc()
+      cat(sprintf("seed=%d | entropy | %d | \n",
+                  seed, nrow(df)))
+    }
+  }
+}
+```
+
+
+
+```{r SLGP_compil_seq_vs_others, message=FALSE, eval=FALSE, warning=FALSE}
+library(ggplot2)
+
+seeds <- seq(10)
+n_end <- 38
+df2 <- data.frame()
+for(seed in seeds){
+  for (step in c(10, 50, 100, 200)) {
+    out1 <- sprintf("./res_synth/case1_seq/GP/summary_seed%s_step%d_n%d.csv",
+                    seed, step, step)
+    out2 <- sprintf("./res_synth/case1_seq/xgboost/summary_seed%s_n%d.csv",
+                    seed, step)
+    
+    res_gp <- read.csv(out1)
+    colnames(res_gp)[6:8] <- c("W1", "KL_EstTrue", "KL_TrueEst")
+    res_xgb <- read.csv(out2)
+    colnames(res_xgb)[6:8] <- c("KL_TrueEst", "KL_EstTrue", "W1")
+    df2 <- rbind(df2, 
+                 res_gp, 
+                 res_xgb)
+  }
+  for (step in seq(n_end+1)) {
+    out3 <- sprintf("./res_synth/case1_seq/xgboost/entropy_seed%d_n%d.csv",
+                    seed, step)
+    
+    res_xgb2 <- read.csv(out3)
+    colnames(res_xgb2)[6:8] <- c("KL_TrueEst", "KL_EstTrue", "W1")
+    df2 <- rbind(df2, res_xgb2)
+  }
+}
+
+save(df2, file="./res_synth/case1_seq/compiled2.RData")
+```
+
+
+
+```{r SLGP_vs_others, message=FALSE, warning=FALSE}
+library(SLGP)
+load(file="./res_synth/case1_seq/compiled.RData")
+load(file="./res_synth/case1_seq/compiled2.RData")
+name_map <- c(
+  "W1" = "Integrated Wasserstein 1 (Model, Bin)",
+  "H" = "Hellinger(SLGP, Bin)",
+  "KL_EstTrue" = "Integrated Kullback-Leibler(Model, Bin)",
+  "KL_TrueEst" = "Integrated Kullback-Leibler(Bin, Model)",
+  "TV" = "Total variation(Model, Bin)")
+method_labs <- c(
+  "SLGP" = "SLGP - random design",
+  "GPflow_multiclass_GP"  = "Multi-class GP - random design",
+  "xgboost"  = "XGboost - random design",
+  "xgboost_ent"  = "XGboost - predictive entropy"
+)
+name_crit <- "KL_TrueEst"
+name_strat <- "random"
+df <- df %>%
+  filter(nFreq == 100) %>%
+  filter(strat == name_strat) %>%
+  group_by(seed, n, strat, name) %>%
+  summarise(integratedDist = mean(med), .groups = "drop") %>%
+  group_by(n, strat, name) %>%
+  summarise(
+    med = median(integratedDist),
+    q05 = quantile(integratedDist, probs = 0.05),
+    q25 = quantile(integratedDist, probs = 0.25),
+    q75 = quantile(integratedDist, probs = 0.75),
+    q95 = quantile(integratedDist, probs = 0.95),
+    .groups = "drop"
+  ) %>%
+  filter(name %in%c(name_crit))%>%
+  data.frame()
+
+df$method<- "SLGP"
+df2 <- df2 %>%
+  select(-step)%>%
+  mutate(method=ifelse(method=="xgboost" & design=="pred_entropy",
+                       "xgboost_ent", method))%>%
+  pivot_longer(-c("seed", "n", "method", "design", "fit_time_sec")) %>%
+  group_by(n, method, design, name) %>%
+  summarise(
+    med = median(value),
+    q25 = quantile(value, probs = 0.25),
+    q75 = quantile(value, probs = 0.75),
+    .groups = "drop"
+  ) %>%
+  ungroup()%>%
+  filter(name %in%c(name_crit))%>%
+  data.frame()
+
+df <- rbind(df[, c("n", "name", "method", "med", "q25", "q75")],
+            df2[, c("n", "name", "method", "med", "q25", "q75")])
+
+df %>% ggplot() +
+  geom_line(aes(x = n, y = med, col = method, group = method)) +
+  geom_ribbon(aes(x = n, ymin = q25, ymax = q75, fill = method),
+              alpha = 0.2, lty = 2) +
+  facet_wrap(. ~ name, labeller = 
+               labeller(name = as_labeller(name_map)), 
+             scales = "free_y") +
+  theme_bw() +
+  labs(
+    y = "Integrated distance (log-scale)",
+    x = "n",
+    colour = "Model used",  # legend title for lines
+    fill   = "Model used"   # legend title for ribbons
+  )+
+  scale_colour_discrete(labels = method_labs) +
+  scale_fill_discrete(labels = method_labs)+
+  scale_y_log10()
+
+ggsave("./Figures/Case1_othermodels.pdf", width=6, height=3.5)
+
+load( sprintf("./res_synth/case1_seq/SLGP/SLGP_%s_seed%d_nFreq%d_n%d.RData",
+              "random", 1, 100, 38))
+df1 <- res$slgp@data
+df1 <- rbind(df1, data.frame(p=res$p_new, output=res$t_new))
+
+modelLaplace1 <- retrainSLGP(SLGPmodel=res$slgp, 
+                             newdata = df1,
+                             interpolateBasisFun="nothing", 
+                             nIntegral=n_binom+1,
+                             method="Laplace",
+                             seed = 1,
+                             opts=list(discrete=TRUE,
+                                       ndraws=1000))
+
+gp_pred <- read.csv(sprintf("./res_synth/case1_seq/GP/pred_seed%d_n%d.csv", 1, 200))
+gp_pred <-gp_pred %>% pivot_longer(-p) %>%
+  mutate(name = as.integer(gsub("prob_", "", name)))%>%
+  rename(output=name,
+         GP = value) %>%
+  data.frame()
+xgb_pred <- read.csv(sprintf("./res_synth/case1_seq/xgboost/pred_seed%d_n%d.csv", 1, 200))
+xgb_pred <- xgb_pred %>%
+  rename(XGboost = pred) %>%
+  select(p, output, truth, XGboost)
+
+slgp_pred <- predictSLGP_newNode(modelLaplace1, 
+                                 xgb_pred[, c("p", "output", "truth")], 
+                                 interpolateBasisFun = "nothing", 
+                                 nIntegral=11, discrete = TRUE)
+SLGP_val <- rowMeans(slgp_pred[, -c(1:3)])
+slgp_pred <- slgp_pred[, c(1:3)]
+slgp_pred$SLGP <- SLGP_val
+grid_pred <- merge(slgp_pred, xgb_pred, by=c("p", "output", "truth"))
+grid_pred <- merge(grid_pred, gp_pred, by=c("p", "output"))
+
+out_ticks <- seq(0, 10, 2)
+grid_pred %>%
+  pivot_longer(-c("p", "output"))%>%
+  filter(p %in% c(0, 0.25, 0.5, 0.75, 1.0))%>%
+  ggplot()+
+  ylab("Probability")+
+  xlab("k")+
+  geom_step(mapping=aes(x=output, y=value, col=name, lty=name), direction = "mid")+
+  facet_grid(.~paste0("p=", p))+
+  theme_bw()+
+  scale_x_continuous(breaks = out_ticks) +  
+  scale_colour_manual(
+    name   = "Model used",
+    breaks = c("truth", "SLGP", "XGboost", "GP"), 
+    labels = c(truth   = "Ground truth",
+               SLGP  = "SLGP - random design",
+               XGboost = "XGboost - random design",
+               GP = "Multiclass GP - random design"),
+    values=c(truth   = "grey",
+             SLGP  = "navy",
+             XGboost = "chartreuse3",
+             GP    = "red"))+  
+  scale_linetype_manual(
+    name   = "Model used",
+    breaks = c("truth", "SLGP", "XGboost", "GP"), 
+    labels = c(truth   = "Ground truth",
+               SLGP  = "SLGP - random design",
+               XGboost = "XGboost - random design",
+               GP = "Multiclass GP - random design"),
+    values=c(truth = 2,
+             SLGP = 1,
+             XGboost = 4,
+             GP = 3))
+
+ggsave("./Figures/Case1_pannelsothermethods.pdf", width=8, height=2.5)
 
 ```
 
