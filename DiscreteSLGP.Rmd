@@ -1738,7 +1738,7 @@ df %>%
   theme_bw() +
   labs(
     y = "Integrated distance",
-    x = "n",
+    x = "Sample size n",
     colour = "Acquisition strategy",  # legend title for lines
     linetype = "Acquisition strategy",  # legend title for linetype
     fill   = "Acquisition strategy"   # legend title for ribbons
@@ -1807,8 +1807,14 @@ grid_pred %>%
   ggplot()+
   ylab("Probability")+
   xlab("k")+
-  geom_step(mapping=aes(x=output, y=value, col=name, lty=name), direction = "mid")+
-  facet_wrap(paste0("n=", n)~paste0("p=", p), nrow=3)+
+  geom_step(mapping=aes(x=output, y=value, 
+                        col=name, lty=name), direction = "mid")+
+  facet_wrap(n ~ p , 
+             nrow=3, labeller = labeller(
+    n = function(x) paste0("n[bin]==", x),
+    p = function(x) paste0("p==", x),
+    .default = label_parsed
+  ))+
   theme_bw()+
   scale_x_continuous(breaks = out_ticks) +  
   scale_colour_manual(
@@ -1845,9 +1851,9 @@ grid_pred %>%
   geom_step(aes(x = output, y = truth), col = "grey", direction = "mid") +
   facet_wrap(~ n + p, nrow = 4,
              labeller = labeller(
-               n = function(x) paste0("n=", x),
-               p = function(x) paste0("p=", x)
-             )) +
+    n = function(x) paste0("n[bin]==", x),
+    p = function(x) paste0("p==", x),
+    .default = label_parsed)) +
   theme_bw() +
   scale_x_continuous(breaks = out_ticks)
 
@@ -2203,7 +2209,7 @@ df %>%
   theme_bw() +
   labs(
     y = "Integrated distance",
-    x = "n",
+    x = "Sample size n",
     colour = "Acquisition strategy",  # legend title for lines
     linetype = "Acquisition strategy",  # legend title for linetype
     fill   = "Acquisition strategy"   # legend title for ribbons
@@ -2273,7 +2279,11 @@ grid_pred %>%
   ylab("Probability")+
   xlab("k")+
   geom_step(mapping=aes(x=output, y=value, col=name, lty=name), direction = "mid")+
-  facet_wrap(paste0("n=", n)~paste0("p=", p), nrow=3)+
+  facet_wrap(~ n + p, nrow = 3,
+             labeller = labeller(
+    n = function(x) paste0("n[bin]==", x),
+    p = function(x) paste0("p==", x),
+    .default = label_parsed)) +
   theme_bw()+
   scale_x_continuous(breaks = out_ticks) +  
   scale_colour_manual(
